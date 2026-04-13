@@ -1,7 +1,7 @@
 [solution]
-name = "anthony-solution-v1"      # Solution name
+name = "JensenHireMe-solution-v1"      # Solution name
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "anthony"              # Team/author name
+author = "JensenHireMe"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
