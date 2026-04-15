@@ -1,66 +1,58 @@
-import math
 import torch
+import flashinfer.decode
+
+_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+_workspace_cache = {}
+
+QK_NOPE_HEAD_DIM = 128
+KV_LORA_RANK = 512
+QK_ROPE_HEAD_DIM = 64
+TOPK = 2048
 
 
-@torch.no_grad()
+def _get_workspace(device):
+    key = str(device)
+    buf = _workspace_cache.get(key)
+    if buf is None:
+        buf = torch.zeros(_WORKSPACE_SIZE_BYTES, dtype=torch.uint8, device=device)
+        _workspace_cache[key] = buf
+    return buf
+
+
 def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale):
-    num_tokens, num_qo_heads, head_dim_ckv = q_nope.shape
-    head_dim_kpe = q_pe.shape[-1]
+    num_tokens = q_nope.shape[0]
     num_pages, page_size, _ = ckv_cache.shape
-    topk = sparse_indices.shape[-1]
-
-    # Check constants
-    assert num_qo_heads == 16
-    assert head_dim_ckv == 512
-    assert head_dim_kpe == 64
-    assert page_size == 64
-    assert topk == 2048
-
-    # Check constraints
-    assert sparse_indices.shape[0] == num_tokens
-    assert sparse_indices.shape[-1] == topk
-    assert ckv_cache.shape[1] == page_size
-
     device = q_nope.device
 
-    # Flatten paged KV cache to token-level: [num_pages, page_size, dim] -> [num_pages * page_size, dim]
-    Kc_all = ckv_cache.reshape(-1, head_dim_ckv).to(torch.float32)  # [total_kv_tokens, head_dim_ckv]
-    Kp_all = kpe_cache.reshape(-1, head_dim_kpe).to(torch.float32)  # [total_kv_tokens, head_dim_kpe]
+    if isinstance(sm_scale, torch.Tensor):
+        bmm1_scale = float(sm_scale.item())
+    else:
+        bmm1_scale = float(sm_scale)
 
-    output = torch.zeros(
-        (num_tokens, num_qo_heads, head_dim_ckv), dtype=torch.bfloat16, device=device
+    query = torch.cat([q_nope, q_pe], dim=-1).unsqueeze(1)  # [T, 1, H, ckv+kpe]
+    kv_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)    # [num_pages, page_size, ckv+kpe]
+    block_tables = sparse_indices.unsqueeze(1)              # [T, 1, topk]
+
+    # seq_lens = number of valid (non -1) entries per token
+    # The kernel only reads the first seq_lens entries from block_tables;
+    # valid entries are already contiguous at the front.
+    seq_lens = (sparse_indices != -1).sum(dim=1).to(torch.int32)
+    max_seq_len = int(seq_lens.max().item())
+    workspace = _get_workspace(device)
+
+    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        sparse_mla_top_k=TOPK,
+        bmm1_scale=bmm1_scale,
     )
-    lse = torch.full((num_tokens, num_qo_heads), -float("inf"), dtype=torch.float32, device=device)
+    output = output.squeeze(1)  # [T, H, ckv]
 
-    for t in range(num_tokens):
-        indices = sparse_indices[t]  # [topk]
-
-        # Handle padding: -1 indicates invalid indices
-        valid_mask = indices != -1
-        valid_indices = indices[valid_mask]
-
-        if valid_indices.numel() == 0:
-            output[t].zero_()
-            continue
-
-        # For page_size=64, indices encode (page_idx * 64 + offset)
-        tok_idx = valid_indices.to(torch.long)
-
-        Kc = Kc_all[tok_idx]  # [num_valid, head_dim_ckv]
-        Kp = Kp_all[tok_idx]  # [num_valid, head_dim_kpe]
-        qn = q_nope[t].to(torch.float32)  # [num_qo_heads, head_dim_ckv]
-        qp = q_pe[t].to(torch.float32)  # [num_qo_heads, head_dim_kpe]
-
-        # Compute attention logits
-        logits = (qn @ Kc.T) + (qp @ Kp.T)  # [num_qo_heads, num_valid]
-        logits_scaled = logits * sm_scale
-
-        # Compute 2-base LSE
-        lse[t] = torch.logsumexp(logits_scaled, dim=-1) / math.log(2.0)
-
-        # Compute attention output
-        attn = torch.softmax(logits_scaled, dim=-1)  # [num_qo_heads, num_valid]
-        out = attn @ Kc  # [num_qo_heads, head_dim_ckv]
-        output[t] = out.to(torch.bfloat16)
-
-    return output, lse
+    return (output,)
