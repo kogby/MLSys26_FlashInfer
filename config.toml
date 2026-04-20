@@ -1,8 +1,8 @@
 [solution]
-name = "JensenHireMe-solution-v1"      # Solution name
+name = "JensenHireMe-solution-v2"      # Solution name
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"          # Track: fused_moe | sparse_attention | gated_delta_net
 author = "JensenHireMe"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel.py::kernel"            # Kernel function name
+entry_point = "kernel_v2.py::run"      # Kernel function name
