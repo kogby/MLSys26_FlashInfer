@@ -52,11 +52,17 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
+    # Respect optional destination_passing_style override from config.toml.
+    # Default True (framework default) — set False in config for value-returning
+    # style kernels (e.g. topk indexer definition uses return-tuple semantics).
+    dps = build_config.get("destination_passing_style", True)
+
     # Create build spec
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        destination_passing_style=dps,
     )
 
     # Pack the solution

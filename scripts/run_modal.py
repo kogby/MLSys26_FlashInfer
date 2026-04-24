@@ -27,13 +27,39 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .apt_install("git")
+    # cupti-python: lets flashinfer-bench use CUPTI for ~10ns-precision GPU
+    # timing instead of CUDA events. Matches the official eval environment.
+    .pip_install(
+        "torch", "triton", "numpy", "cupti-python",
+        # Needed to try running kernel_idxerv3.py (tcgen05 FP8 MMA reference).
+        # If idxerv3 fails to build, remove this and keep image minimal.
+        "nvidia-cutlass-dsl",
+        # `ncu` CLI is needed by the `profile_ncu` entrypoint. PyPI wheel
+        # bundles the Nsight Compute binary without needing the CUDA apt repo.
+        "nvidia-nsight-compute",
+    )
+    # IMPORTANT: install flashinfer-bench FROM SOURCE. The PyPI release is
+    # older than 2026-04-10 and lacks the DsaTopkIndexerEvaluator (PR #354)
+    # that handles NaN-ordering differences via sorted-score comparison.
+    # FAQ.md recommends installing from source for latest eval changes.
+    .run_commands(
+        "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
+        "cd /opt/flashinfer-bench && pip install -v -e .",
+    )
+    # DEBUG_TOPK: '1' triggers the per-batch ref diff print inside
+    # kernel_topk_indexer.py's `run`. Keep '0' for normal runs.
+    .env({"DEBUG_TOPK": "0"})
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark on Modal B200 and return results."""
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = None) -> dict:
+    """Run benchmark on Modal B200 and return results.
+
+    If `max_workloads` is set, only the first N workloads are run (handy for
+    iterating on correctness / debugging before a full sweep).
+    """
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -47,6 +73,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if max_workloads is not None:
+        workloads = workloads[:max_workloads]
+        print(f"DEBUG MODE: running only the first {len(workloads)} workloads")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -67,6 +97,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
+                "log": trace.evaluation.log,  # full stdout/stderr incl. compile errors
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
@@ -82,6 +113,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
+    failure_logs_printed = False
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
@@ -101,17 +133,56 @@ def print_results(results: dict):
 
             print()
 
+        # If any workload failed, dump the log of the WORST failure (largest
+        # abs_err) so we see the most revealing bug, not just the first mild one.
+        if not failure_logs_printed:
+            worst = None
+            worst_err = -1.0
+            for workload_uuid, result in traces.items():
+                if result.get("status") != "PASSED" and result.get("log"):
+                    err = result.get("max_abs_error") or 0
+                    if err > worst_err:
+                        worst_err = err
+                        worst = (workload_uuid, result)
+            if worst is not None:
+                workload_uuid, result = worst
+                print("\n" + "=" * 70)
+                print(f"Worst failure log ({workload_uuid[:8]}..., "
+                      f"{result.get('status')}, abs_err={worst_err:.2e}):")
+                print("=" * 70)
+                print(result["log"])
+                print("=" * 70)
+                failure_logs_printed = True
+
 
 @app.local_entrypoint()
-def main():
-    """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+def main(use_official_baseline: bool = False):
+    """Pack our solution and run benchmark on Modal.
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+    Args:
+        use_official_baseline: if True, skip pack_solution and load the
+            upstream flashinfer+deep_gemm baseline JSON instead. Used for
+            sanity-checking that the framework runs cleanly end-to-end.
+    """
+    if use_official_baseline:
+        baseline_path = (
+            PROJECT_ROOT
+            / "mlsys26-contest"
+            / "solutions"
+            / "baseline"
+            / "dsa"
+            / "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+            / "flashinfer_deepgemm_wrapper_2ba145.json"
+        )
+        print(f"SANITY MODE: loading official baseline from {baseline_path}")
+        solution = Solution.model_validate_json(baseline_path.read_text())
+    else:
+        from scripts.pack_solution import pack_solution
+        print("Packing solution from source files...")
+        solution_path = pack_solution()
+        print("\nLoading solution...")
+        solution = Solution.model_validate_json(solution_path.read_text())
 
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
@@ -122,3 +193,91 @@ def main():
         return
 
     print_results(results)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NCU profiling (optional entrypoint)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.function(image=image, gpu="B200:1", timeout=600, volumes={TRACE_SET_PATH: trace_volume})
+def run_ncu(solution: Solution, workload_uuid: str = None, ncu_set: str = "detailed",
+            page: str = "details", timeout: int = 120) -> str:
+    """Run NCU profiling on one workload via flashinfer_bench's NCU helper.
+
+    This uses the bench's supported ncu wrapper, which knows how to build the
+    kernel and invoke ncu with the right perf-counter permissions inside the
+    eval sandbox. Returns the NCU textual report.
+
+    Args:
+        solution: the packed Solution to profile.
+        workload_uuid: UUID (or prefix) of the workload to target. Defaults to
+            the FIRST workload if not provided — pick a representative one for
+            meaningful results (e.g. a medium-sized one).
+        ncu_set: section set for ncu ("basic", "detailed", "full", ...).
+        page: "raw", "details", or "source".
+        timeout: seconds ncu is allowed to run.
+    """
+    from flashinfer_bench.agents import flashinfer_bench_run_ncu
+
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    workloads = trace_set.workloads.get(solution.definition, [])
+    if not workloads:
+        return f"ERROR: no workloads for definition '{solution.definition}'"
+
+    # Pick workload: first matching prefix, or index 0.
+    target = None
+    if workload_uuid:
+        for w in workloads:
+            if w.uuid.startswith(workload_uuid):
+                target = w
+                break
+        if target is None:
+            return f"ERROR: no workload starts with '{workload_uuid}'"
+    else:
+        target = workloads[0]
+
+    print(f"Profiling workload {target.uuid} (set={ncu_set}, page={page})...")
+    return flashinfer_bench_run_ncu(
+        solution=solution,
+        workload=target,
+        trace_set_path=TRACE_SET_PATH,
+        set=ncu_set,
+        page=page,
+        timeout=timeout,
+    )
+
+
+@app.local_entrypoint()
+def profile_ncu(
+    workload_uuid: str = "",
+    ncu_set: str = "detailed",
+    page: str = "details",
+    timeout: int = 120,
+):
+    """Run NCU profiling on a single workload and print the report.
+
+    Usage:
+        modal run scripts/run_modal.py::profile_ncu
+        modal run scripts/run_modal.py::profile_ncu --workload-uuid 30cecff1
+        modal run scripts/run_modal.py::profile_ncu --ncu-set full --timeout 300
+    """
+    from scripts.pack_solution import pack_solution
+    print("Packing solution from source files...")
+    solution_path = pack_solution()
+    solution = Solution.model_validate_json(solution_path.read_text())
+    print(f"Loaded: {solution.name} ({solution.definition})")
+
+    print("\nRunning NCU on Modal B200...")
+    report = run_ncu.remote(
+        solution=solution,
+        workload_uuid=workload_uuid or None,
+        ncu_set=ncu_set,
+        page=page,
+        timeout=timeout,
+    )
+
+    print("\n" + "=" * 70)
+    print("NCU REPORT")
+    print("=" * 70)
+    print(report)
+    print("=" * 70)
