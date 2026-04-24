@@ -23,15 +23,16 @@ import torch
 import triton
 import triton.language as tl
 
-# Set DEBUG_TOPK=1 in the Modal env to make `run` also compute the reference
-# (PyTorch ground truth) path and print a diff of the first few mismatched
-# positions per batch. Stdout is captured by the framework and surfaced in
-# run_modal.py's "First failure log" block.
-_DEBUG = os.environ.get("DEBUG_TOPK", "0") == "1"
+# Set FIB_DEBUG=1 in the Modal env (via `--debug True` on run_modal.py) to make
+# `run` also compute the reference (PyTorch ground truth) path and print a diff
+# of the first few mismatched positions per batch. Stdout is captured by the
+# framework and surfaced in run_modal.py's "First failure log" block.
+_DEBUG = os.environ.get("FIB_DEBUG", "0") == "1"
 
-# Set PROFILE_TOPK=1 in the Modal env to print per-stage CUDA-event timings
-# for every `run()` call. Uses torch.cuda.Event (no CUPTI, no profiler).
-_PROFILE = os.environ.get("PROFILE_TOPK", "0") == "1"
+# Set FIB_PROFILE=1 in the Modal env (via `--profile True` on run_modal.py) to
+# print per-stage CUDA-event timings for every `run()` call. Uses
+# torch.cuda.Event (no CUPTI, no profiler).
+_PROFILE = os.environ.get("FIB_PROFILE", "0") == "1"
 
 # Benchmark calls run() ~515x per workload. Limit prints to a small middle
 # slice so stdout stays readable.
@@ -341,7 +342,7 @@ def _debug_diff_against_reference(
     ref_ti = ref_topk.detach().cpu()
     seq_lens_cpu = seq_lens.tolist()
 
-    print("\n=== DEBUG_TOPK DIFF (Triton vs PyTorch reference) ===")
+    print("\n=== FIB_DEBUG DIFF (Triton vs PyTorch reference) ===")
     print(f"batch_size={batch_size}, shape={tuple(our_ti.shape)}")
 
     any_diff = False
@@ -399,4 +400,4 @@ def _debug_diff_against_reference(
 
     if not any_diff:
         print("All batches match the reference.")
-    print("=== END DEBUG_TOPK DIFF ===\n")
+    print("=== END FIB_DEBUG DIFF ===\n")

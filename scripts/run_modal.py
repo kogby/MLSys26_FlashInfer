@@ -8,6 +8,35 @@ Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
+
+Usage:
+    modal run scripts/run_modal.py [OPTIONS]
+
+Options:
+    --track TEXT                 [required] Track subdirectory (containing
+                                 config.toml). One of:
+                                 dsa_indexer | dsa_attention | moe.
+
+    --use-official-baseline /    Load the upstream flashinfer+deep_gemm
+    --no-use-official-baseline   baseline JSON instead of packing from source
+                                 (sanity check; only meaningful for
+                                 dsa_indexer).
+                                 Default: --no-use-official-baseline
+
+    --debug / --no-debug         Sets FIB_DEBUG=1/0 in the container. Kernels
+                                 that support it (e.g. dsa_indexer) re-run the
+                                 PyTorch reference and print a per-batch diff.
+                                 Default: --no-debug
+
+    --profile / --no-profile     Sets FIB_PROFILE=1/0 in the container.
+                                 Kernels that support it print per-stage
+                                 CUDA-event timings on every call.
+                                 Default: --no-profile
+
+    --max-workloads INT          Run only the first N workloads. 0 or negative
+                                 means run all.
+                                 Default: 0 (run all)
+
 """
 
 import sys
@@ -47,22 +76,30 @@ image = (
         "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
         "cd /opt/flashinfer-bench && pip install -v -e .",
     )
-    # DEBUG_TOPK: '1' triggers the per-batch ref diff print inside
-    # kernel_topk_indexer.py's `run`. Keep '0' for normal runs.
-    # Env flags read by kernel_topk_indexer.py:
-    #   DEBUG_TOPK=1    → re-run the PyTorch reference and print a diff
-    #   PROFILE_TOPK=1  → print per-stage CUDA-event timings every call
-    .env({"DEBUG_TOPK": "0", "PROFILE_TOPK": "1"})
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None, max_workloads: int = None) -> dict:
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    max_workloads: int = None,
+    debug: bool = False,
+    profile: bool = False,
+) -> dict:
     """Run benchmark on Modal B200 and return results.
 
     If `max_workloads` is set, only the first N workloads are run (handy for
     iterating on correctness / debugging before a full sweep).
+
+    Generic env flags read by any track's kernel:
+      FIB_DEBUG=1    → kernel may re-run the reference and print a diff
+      FIB_PROFILE=1  → kernel may print per-stage CUDA-event timings
     """
+    import os
+    os.environ["FIB_DEBUG"] = "1" if debug else "0"
+    os.environ["FIB_PROFILE"] = "1" if profile else "0"
+
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -159,23 +196,16 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(track: str = "dsa_indexer", use_official_baseline: bool = False):
+def main(
+    track: str,
+    use_official_baseline: bool = False,
+    debug: bool = False,
+    profile: bool = False,
+    max_workloads: int = 0,
+):
     """Pack the solution for one track and run benchmark on Modal.
 
-    Args:
-        track: subdirectory containing config.toml — one of
-            "dsa_indexer", "dsa_attention", "moe". Maps to the FAQ-recommended
-            multi-track repo layout.
-        use_official_baseline: if True, skip pack_solution and load the
-            upstream flashinfer+deep_gemm baseline JSON instead. Used for
-            sanity-checking that the framework runs cleanly end-to-end.
-            (Only meaningful for the dsa_indexer track.)
-
-    Usage:
-        modal run scripts/run_modal.py                                # defaults to dsa_indexer
-        modal run scripts/run_modal.py --track dsa_attention
-        modal run scripts/run_modal.py --track moe
-        modal run scripts/run_modal.py --use-official-baseline
+    See the module-level docstring for the full option/example reference.
     """
     if use_official_baseline:
         baseline_path = (
@@ -199,9 +229,15 @@ def main(track: str = "dsa_indexer", use_official_baseline: bool = False):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    # Small subset while PROFILE_TOPK is on — profile output would flood stdout
-    # otherwise. Set max_workloads=None once profiling env is disabled.
-    results = run_benchmark.remote(solution, max_workloads=5)
+    # Small subset while --profile is on — profile output would flood stdout
+    # otherwise. Pass --max-workloads 0 for the full sweep.
+    workload_limit = max_workloads if max_workloads and max_workloads > 0 else None
+    results = run_benchmark.remote(
+        solution,
+        max_workloads=workload_limit,
+        debug=debug,
+        profile=profile,
+    )
 
     if not results:
         print("No results returned!")
