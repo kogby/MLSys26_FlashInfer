@@ -8,4 +8,4 @@ author = "JensenHireMe"              # Team/author name
 [build]
 language = "triton"               # triton | cuda
 # entry_point = "kernel_v2.py::run"                 # paired with sparse_attention definition above
-entry_point = "kernel_topk_indexer.py::run"         # paired with topk_indexer definition above
+entry_point = "kernel_topk_indexer.py::run"         # our solution (Level 2a: Triton fused score kernel)

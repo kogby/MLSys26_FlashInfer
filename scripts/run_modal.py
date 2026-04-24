@@ -27,7 +27,26 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .apt_install("git")
+    # cupti-python: lets flashinfer-bench use CUPTI for ~10ns-precision GPU
+    # timing instead of CUDA events. Matches the official eval environment.
+    .pip_install(
+        "torch", "triton", "numpy", "cupti-python",
+        # Needed to try running kernel_idxerv3.py (tcgen05 FP8 MMA reference).
+        # If idxerv3 fails to build, remove this and keep image minimal.
+        "nvidia-cutlass-dsl",
+    )
+    # IMPORTANT: install flashinfer-bench FROM SOURCE. The PyPI release is
+    # older than 2026-04-10 and lacks the DsaTopkIndexerEvaluator (PR #354)
+    # that handles NaN-ordering differences via sorted-score comparison.
+    # FAQ.md recommends installing from source for latest eval changes.
+    .run_commands(
+        "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
+        "cd /opt/flashinfer-bench && pip install -v -e .",
+    )
+    # DEBUG_TOPK: '1' triggers the per-batch ref diff print inside
+    # kernel_topk_indexer.py's `run`. Keep '0' for normal runs.
+    .env({"DEBUG_TOPK": "0"})
 )
 
 
@@ -111,18 +130,26 @@ def print_results(results: dict):
 
             print()
 
-        # If any workload failed, dump the log of the FIRST failure so we can
-        # debug compile/runtime errors without flooding stdout with 80 copies.
+        # If any workload failed, dump the log of the WORST failure (largest
+        # abs_err) so we see the most revealing bug, not just the first mild one.
         if not failure_logs_printed:
+            worst = None
+            worst_err = -1.0
             for workload_uuid, result in traces.items():
                 if result.get("status") != "PASSED" and result.get("log"):
-                    print("\n" + "=" * 70)
-                    print(f"First failure log ({workload_uuid[:8]}..., {result.get('status')}):")
-                    print("=" * 70)
-                    print(result["log"])
-                    print("=" * 70)
-                    failure_logs_printed = True
-                    break
+                    err = result.get("max_abs_error") or 0
+                    if err > worst_err:
+                        worst_err = err
+                        worst = (workload_uuid, result)
+            if worst is not None:
+                workload_uuid, result = worst
+                print("\n" + "=" * 70)
+                print(f"Worst failure log ({workload_uuid[:8]}..., "
+                      f"{result.get('status')}, abs_err={worst_err:.2e}):")
+                print("=" * 70)
+                print(result["log"])
+                print("=" * 70)
+                failure_logs_printed = True
 
 
 @app.local_entrypoint()
@@ -156,9 +183,9 @@ def main(use_official_baseline: bool = False):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    # For sanity-check runs, limit to a few workloads to keep iteration fast.
-    max_workloads = 5 if use_official_baseline else None
-    results = run_benchmark.remote(solution, max_workloads=max_workloads)
+    # DEBUG: idxerv3 experiment — tight workload count.
+    # Set back to None for full sweep of our own solution.
+    results = run_benchmark.remote(solution, max_workloads=5)
 
     if not results:
         print("No results returned!")

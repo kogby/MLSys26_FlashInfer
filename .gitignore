@@ -219,3 +219,5 @@ __marimo__/
 mlsys26-contest
 .DS_Store
 .local
+/notes
+.claude
