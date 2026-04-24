@@ -1,12 +1,19 @@
 """
-TopK Indexer Kernel for FlashInfer Competition — conservative Step-1 version.
+TopK Indexer Kernel for FlashInfer Competition — Level 3.
 
 Strategy:
-- FP8 dequant is done in PyTorch (same as the reference) — proven correct,
-  no Triton FP8 bitcast to debug.
-- Triton kernel consumes the dequantised float32 K and fused-computes
-  score[b, t] = sum_h( weights[b,h] * ReLU( Q[b,h,:] . K[t,:] ) ) per page.
-- Final topk still done via a per-batch PyTorch loop (to be vectorised later).
+- No upfront dequant. Triton kernel reads FP8 bytes + per-token f32 scales
+  directly from the paged KV cache, performs an FP8 Tensor Core matmul via
+  tl.dot(fp8_Q, fp8_K.T), then applies per-token scale ONCE at the end.
+- Math identity used to keep FP8 matmul clean:
+    score[t] = sum_h weights[h] * ReLU( Q[h] . K[t] * scale[t] )
+             = sum_h weights[h] * ReLU( scale[t] * (Q[h] . K[t]) )
+             = sum_h weights[h] * max(0, scale[t] * acc_fp8[h, t])
+  This matches idxerv3's observation that scale must be applied INSIDE the
+  ReLU (scale can be negative because it comes from random bytes in the
+  test data).
+- Saves 4x HBM traffic on K (no float32 intermediate) and uses sm_100
+  Tensor Cores for the 64x128x64 MMA.
 
 Definition: dsa_topk_indexer_fp8_h64_d128_topk2048_ps64
 """
@@ -26,17 +33,17 @@ _DEBUG = os.environ.get("DEBUG_TOPK", "0") == "1"
 @triton.jit
 def _fused_score_kernel(
     # Inputs
-    Q_ptr,            # [batch_size, num_heads, head_dim] float32
-    K_ptr,            # [num_pages, page_size, head_dim] float32 (already dequantised)
+    Q_fp8_ptr,        # [batch_size, num_heads, head_dim] float8_e4m3fn
+    KV_bytes_ptr,     # flattened byte pool: [num_pages * page_size * head_dim_sf] uint8
+                      # Per page (8448 bytes): first page_size*head_dim (8192) fp8 data bytes,
+                      # then page_size*4 (256) float32 scale bytes.
     W_ptr,            # [batch_size, num_heads] float32
     BlockTable_ptr,   # [batch_size, max_num_pages] int32
     SeqLens_ptr,      # [batch_size] int32
     # Output
     Scores_ptr,       # [batch_size, max_seq_len] float32
-    # Strides (all inputs are asserted contiguous in the host code, so these
-    # correspond to row strides of the natural layout).
+    # Strides
     stride_q_b, stride_q_h, stride_q_d,
-    stride_k_page, stride_k_tok, stride_k_d,
     stride_w_b, stride_w_h,
     stride_bt_b, stride_bt_p,
     stride_scores_b, stride_scores_t,
@@ -44,9 +51,15 @@ def _fused_score_kernel(
     num_heads: tl.constexpr,      # 64
     head_dim: tl.constexpr,       # 128
     page_size: tl.constexpr,      # 64
-    BLOCK_D: tl.constexpr,        # head_dim block size
+    head_dim_sf: tl.constexpr,    # 132  (128 fp8 + 4 scale bytes per token row)
 ):
-    """Compute weighted-ReLU scores for one page of one batch element."""
+    """FP8 Tensor Core score kernel.
+
+    Each program computes scores for one page of one batch element via:
+        acc[h, t] = sum_d Q_fp8[h, d] * K_fp8[t, d]    (Tensor Core FP8 MMA)
+        scored[h, t] = max(0, acc[h, t] * scale[t])    (ReLU after scale)
+        score[t] = sum_h weights[h] * scored[h, t]
+    """
     page_block_id = tl.program_id(0)
     batch_id = tl.program_id(1)
 
@@ -55,8 +68,8 @@ def _fused_score_kernel(
     if page_block_id >= num_pages_for_seq:
         return
 
-    # int32 page id * stride (can be ~8192) overflows int32 on large caches.
-    # Promote to int64 before the address math.
+    # Promote page id to int64 to avoid overflow in large byte-address math
+    # (global_page_id * 8448 can exceed int32 easily).
     global_page_id = tl.load(
         BlockTable_ptr + batch_id * stride_bt_b + page_block_id * stride_bt_p
     ).to(tl.int64)
@@ -64,42 +77,50 @@ def _fused_score_kernel(
     token_start = page_block_id * page_size
     valid_tokens = tl.minimum(seq_len - token_start, page_size)
 
-    tok_offs = tl.arange(0, page_size)
-    tok_mask = tok_offs < valid_tokens
+    tok_offs = tl.arange(0, page_size)      # [64]
+    tok_mask = tok_offs < valid_tokens      # [64] bool
+    d_offs = tl.arange(0, head_dim)         # [128]
+    h_offs = tl.arange(0, num_heads)        # [64]
 
-    acc_scores = tl.zeros([page_size], dtype=tl.float32)
+    # ── Load Q tile: [num_heads, head_dim] FP8 ──
+    # Q dtype is float8_e4m3fn already (no bitcast needed).
+    q_addrs = batch_id * stride_q_b + h_offs[:, None] * stride_q_h + d_offs[None, :] * stride_q_d
+    q_fp8 = tl.load(Q_fp8_ptr + q_addrs)    # [64, 128] fp8
 
-    for h in range(num_heads):
-        q_base = batch_id * stride_q_b + h * stride_q_h
-        dot = tl.zeros([page_size], dtype=tl.float32)
+    # ── Load K tile (FP8 bytes): [page_size, head_dim] uint8 → bitcast to fp8 ──
+    page_base = global_page_id * (page_size * head_dim_sf)
+    # FP8 data region is the first page_size*head_dim bytes of the page.
+    k_byte_addrs = page_base + tok_offs[:, None] * head_dim + d_offs[None, :]
+    k_bytes = tl.load(
+        KV_bytes_ptr + k_byte_addrs,
+        mask=tok_mask[:, None],
+        other=0,  # padding tokens read 0 (won't contaminate MMA; masked out later)
+    )
+    k_fp8 = k_bytes.to(tl.float8e4nv, bitcast=True)  # [64, 128] fp8
 
-        for d in tl.static_range(0, head_dim, BLOCK_D):
-            d_offs = d + tl.arange(0, BLOCK_D)
+    # ── Load per-token scale: [page_size] float32 ──
+    # Scale region starts at page_base + page_size*head_dim bytes and holds
+    # page_size float32 values (one per token). Use a reinterpreted f32 ptr.
+    scale_f32_base = (page_base + page_size * head_dim) // 4
+    scale_ptr = KV_bytes_ptr.to(tl.pointer_type(tl.float32), bitcast=True)
+    scale = tl.load(scale_ptr + scale_f32_base + tok_offs, mask=tok_mask, other=0.0)
 
-            # Q chunk: [BLOCK_D]
-            q_chunk = tl.load(Q_ptr + q_base + d_offs * stride_q_d)
+    # ── FP8 Tensor Core matmul: Q @ K.T = [num_heads, page_size] ──
+    acc = tl.dot(q_fp8, tl.trans(k_fp8), out_dtype=tl.float32)  # [64, 64] f32
 
-            # K chunk: [page_size, BLOCK_D]
-            k_addrs = (
-                global_page_id * stride_k_page
-                + tok_offs[:, None] * stride_k_tok
-                + d_offs[None, :] * stride_k_d
-            )
-            k_chunk = tl.load(K_ptr + k_addrs, mask=tok_mask[:, None], other=0.0)
+    # ── Apply scale per token (columns), then ReLU (per element) ──
+    # scale can be negative / NaN / inf — same convention as reference. ReLU
+    # clips negatives; NaN survives to match ref (tl.maximum alone may drop NaN).
+    scaled = acc * scale[None, :]                       # [64, 64]
+    is_nan = scaled != scaled
+    relu   = tl.where(is_nan, scaled, tl.maximum(scaled, 0.0))
 
-            dot += tl.sum(k_chunk * q_chunk[None, :], axis=1)
+    # ── Weighted sum over heads ──
+    w = tl.load(W_ptr + batch_id * stride_w_b + h_offs * stride_w_h)  # [64]
+    final = tl.sum(relu * w[:, None], axis=0)           # [64]
 
-        # ReLU, but preserve NaN to match PyTorch torch.relu semantics.
-        # tl.maximum(nan, 0.0) returns 0 on some targets (IEEE maxnum rule),
-        # which causes us to diverge from the reference when K contains NaN.
-        is_nan = dot != dot
-        dot = tl.where(is_nan, dot, tl.maximum(dot, 0.0))
-
-        w = tl.load(W_ptr + batch_id * stride_w_b + h * stride_w_h)
-        acc_scores += dot * w
-
-    # Write tail tokens as -inf so they lose the top-k race later.
-    out_scores = tl.where(tok_mask, acc_scores, float("-inf"))
+    # ── Store: padding positions as -inf so they never win top-k ──
+    out_scores = tl.where(tok_mask, final, float("-inf"))
     out_offs = batch_id * stride_scores_b + (token_start + tok_offs) * stride_scores_t
     tl.store(Scores_ptr + out_offs, out_scores)
 
@@ -129,22 +150,27 @@ def _dequant_fp8_kv_cache(k_index_cache_fp8):
 
 
 def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_indices):
-    """DPS entry point — Level 2a: Triton-accelerated score computation.
+    """DPS entry point — Level 3: FP8 Tensor Core kernel, no upfront dequant.
 
-    FP8 dequant still done in PyTorch (same as Level 1), but score computation
-    (Q @ K.T + ReLU + weighted sum over heads) fused into a single Triton kernel
-    over ALL batches + pages in parallel. Top-k still per-batch (preserves
-    numerical match with the reference).
+    Kernel reads FP8 bytes + per-token scales directly from the paged cache
+    and runs an FP8 MMA via tl.dot. Scale is applied inside ReLU (after MMA)
+    to preserve the reference semantics (scales can be negative / NaN).
     """
     batch_size, num_index_heads, index_head_dim = q_index_fp8.shape
-    _, page_size, _, _ = k_index_cache_fp8.shape
+    _, page_size, _, head_dim_sf = k_index_cache_fp8.shape
     topk = topk_indices.shape[1]
     max_num_pages = block_table.shape[1]
     max_seq_len = max_num_pages * page_size
     device = q_index_fp8.device
 
-    q = q_index_fp8.to(torch.float32).contiguous()                     # [B, H, D]
-    K_all = _dequant_fp8_kv_cache(k_index_cache_fp8).contiguous()      # [num_pages, ps, D]
+    # Q is already float8_e4m3fn; just enforce contiguous layout for clean strides.
+    q = q_index_fp8.contiguous()
+
+    # Flatten KV cache to a byte pool so the Triton kernel can address both the
+    # FP8 data region and the scale region with plain uint8 arithmetic.
+    # Shape: [num_pages * page_size * head_dim_sf] uint8.
+    kv_bytes = k_index_cache_fp8.view(torch.uint8).contiguous().view(-1)
+
     w = weights.contiguous()
     bt = block_table.contiguous()
 
@@ -155,19 +181,18 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
         dtype=torch.float32, device=device,
     )
 
-    # Launch fused score kernel: one program per (page, batch).
+    # Launch FP8 Tensor Core score kernel: one program per (page, batch).
     grid = (max_num_pages, batch_size)
     _fused_score_kernel[grid](
-        q, K_all, w, bt, seq_lens, scores,
+        q, kv_bytes, w, bt, seq_lens, scores,
         q.stride(0), q.stride(1), q.stride(2),
-        K_all.stride(0), K_all.stride(1), K_all.stride(2),
         w.stride(0), w.stride(1),
         bt.stride(0), bt.stride(1),
         scores.stride(0), scores.stride(1),
         num_heads=num_index_heads,
         head_dim=index_head_dim,
         page_size=page_size,
-        BLOCK_D=64,
+        head_dim_sf=head_dim_sf,
     )
 
     # Top-k + index remap: still per-batch, identical to the reference.
