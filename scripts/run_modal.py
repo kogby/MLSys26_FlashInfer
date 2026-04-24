@@ -28,16 +28,16 @@ TRACE_SET_PATH = "/data"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
-    # cupti-python: lets flashinfer-bench use CUPTI for ~10ns-precision GPU
-    # timing instead of CUDA events. Matches the official eval environment.
     .pip_install(
-        "torch", "triton", "numpy", "cupti-python",
-        # Needed to try running kernel_idxerv3.py (tcgen05 FP8 MMA reference).
-        # If idxerv3 fails to build, remove this and keep image minimal.
+        "torch", "triton", "numpy",
+        # cupti-python: flashinfer-bench uses CUPTI for ~10ns precision kernel
+        # timing (falls back to CUDA events if missing). Safe to keep — we're
+        # not running any external CUPTI subscribers (NCU/nsys) anymore.
+        "cupti-python",
+        # Required by the dsa_attention track's kernel_cute_v2.py (imports
+        # `cutlass.cute` for CuTe-DSL kernels). Harmless if unused by
+        # dsa_indexer / moe tracks.
         "nvidia-cutlass-dsl",
-        # `ncu` CLI is needed by the `profile_ncu` entrypoint. PyPI wheel
-        # bundles the Nsight Compute binary without needing the CUDA apt repo.
-        "nvidia-nsight-compute",
     )
     # IMPORTANT: install flashinfer-bench FROM SOURCE. The PyPI release is
     # older than 2026-04-10 and lacks the DsaTopkIndexerEvaluator (PR #354)
@@ -49,7 +49,10 @@ image = (
     )
     # DEBUG_TOPK: '1' triggers the per-batch ref diff print inside
     # kernel_topk_indexer.py's `run`. Keep '0' for normal runs.
-    .env({"DEBUG_TOPK": "0"})
+    # Env flags read by kernel_topk_indexer.py:
+    #   DEBUG_TOPK=1    → re-run the PyTorch reference and print a diff
+    #   PROFILE_TOPK=1  → print per-stage CUDA-event timings every call
+    .env({"DEBUG_TOPK": "0", "PROFILE_TOPK": "1"})
 )
 
 
@@ -156,13 +159,23 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(use_official_baseline: bool = False):
-    """Pack our solution and run benchmark on Modal.
+def main(track: str = "dsa_indexer", use_official_baseline: bool = False):
+    """Pack the solution for one track and run benchmark on Modal.
 
     Args:
+        track: subdirectory containing config.toml — one of
+            "dsa_indexer", "dsa_attention", "moe". Maps to the FAQ-recommended
+            multi-track repo layout.
         use_official_baseline: if True, skip pack_solution and load the
             upstream flashinfer+deep_gemm baseline JSON instead. Used for
             sanity-checking that the framework runs cleanly end-to-end.
+            (Only meaningful for the dsa_indexer track.)
+
+    Usage:
+        modal run scripts/run_modal.py                                # defaults to dsa_indexer
+        modal run scripts/run_modal.py --track dsa_attention
+        modal run scripts/run_modal.py --track moe
+        modal run scripts/run_modal.py --use-official-baseline
     """
     if use_official_baseline:
         baseline_path = (
@@ -178,106 +191,20 @@ def main(use_official_baseline: bool = False):
         solution = Solution.model_validate_json(baseline_path.read_text())
     else:
         from scripts.pack_solution import pack_solution
-        print("Packing solution from source files...")
-        solution_path = pack_solution()
+        print(f"Packing solution for track '{track}'...")
+        solution_path = pack_solution(track)
         print("\nLoading solution...")
         solution = Solution.model_validate_json(solution_path.read_text())
 
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    # Small subset while PROFILE_TOPK is on — profile output would flood stdout
+    # otherwise. Set max_workloads=None once profiling env is disabled.
+    results = run_benchmark.remote(solution, max_workloads=5)
 
     if not results:
         print("No results returned!")
         return
 
     print_results(results)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NCU profiling (optional entrypoint)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.function(image=image, gpu="B200:1", timeout=600, volumes={TRACE_SET_PATH: trace_volume})
-def run_ncu(solution: Solution, workload_uuid: str = None, ncu_set: str = "detailed",
-            page: str = "details", timeout: int = 120) -> str:
-    """Run NCU profiling on one workload via flashinfer_bench's NCU helper.
-
-    This uses the bench's supported ncu wrapper, which knows how to build the
-    kernel and invoke ncu with the right perf-counter permissions inside the
-    eval sandbox. Returns the NCU textual report.
-
-    Args:
-        solution: the packed Solution to profile.
-        workload_uuid: UUID (or prefix) of the workload to target. Defaults to
-            the FIRST workload if not provided — pick a representative one for
-            meaningful results (e.g. a medium-sized one).
-        ncu_set: section set for ncu ("basic", "detailed", "full", ...).
-        page: "raw", "details", or "source".
-        timeout: seconds ncu is allowed to run.
-    """
-    from flashinfer_bench.agents import flashinfer_bench_run_ncu
-
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
-    workloads = trace_set.workloads.get(solution.definition, [])
-    if not workloads:
-        return f"ERROR: no workloads for definition '{solution.definition}'"
-
-    # Pick workload: first matching prefix, or index 0.
-    target = None
-    if workload_uuid:
-        for w in workloads:
-            if w.uuid.startswith(workload_uuid):
-                target = w
-                break
-        if target is None:
-            return f"ERROR: no workload starts with '{workload_uuid}'"
-    else:
-        target = workloads[0]
-
-    print(f"Profiling workload {target.uuid} (set={ncu_set}, page={page})...")
-    return flashinfer_bench_run_ncu(
-        solution=solution,
-        workload=target,
-        trace_set_path=TRACE_SET_PATH,
-        set=ncu_set,
-        page=page,
-        timeout=timeout,
-    )
-
-
-@app.local_entrypoint()
-def profile_ncu(
-    workload_uuid: str = "",
-    ncu_set: str = "detailed",
-    page: str = "details",
-    timeout: int = 120,
-):
-    """Run NCU profiling on a single workload and print the report.
-
-    Usage:
-        modal run scripts/run_modal.py::profile_ncu
-        modal run scripts/run_modal.py::profile_ncu --workload-uuid 30cecff1
-        modal run scripts/run_modal.py::profile_ncu --ncu-set full --timeout 300
-    """
-    from scripts.pack_solution import pack_solution
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
-
-    print("\nRunning NCU on Modal B200...")
-    report = run_ncu.remote(
-        solution=solution,
-        workload_uuid=workload_uuid or None,
-        ncu_set=ncu_set,
-        page=page,
-        timeout=timeout,
-    )
-
-    print("\n" + "=" * 70)
-    print("NCU REPORT")
-    print("=" * 70)
-    print(report)
-    print("=" * 70)

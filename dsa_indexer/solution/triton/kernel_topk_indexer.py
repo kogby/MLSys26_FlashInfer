@@ -29,6 +29,18 @@ import triton.language as tl
 # run_modal.py's "First failure log" block.
 _DEBUG = os.environ.get("DEBUG_TOPK", "0") == "1"
 
+# Set PROFILE_TOPK=1 in the Modal env to print per-stage CUDA-event timings
+# for every `run()` call. Uses torch.cuda.Event (no CUPTI, no profiler).
+_PROFILE = os.environ.get("PROFILE_TOPK", "0") == "1"
+
+# Benchmark calls run() ~515x per workload. Limit prints to a small middle
+# slice so stdout stays readable.
+_profile_ctx = {"n": 0, "min": 3, "max": 8}
+
+
+def _mk_events(n: int):
+    return [torch.cuda.Event(enable_timing=True) for _ in range(n)]
+
 
 @triton.jit
 def _fused_score_kernel(
@@ -163,25 +175,36 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
     max_seq_len = max_num_pages * page_size
     device = q_index_fp8.device
 
-    # Q is already float8_e4m3fn; just enforce contiguous layout for clean strides.
+    # Decide whether to profile THIS call. Only print the middle iterations
+    # (after JIT warmup, before end) to avoid washing out stdout.
+    profile_this_call = False
+    if _PROFILE:
+        n = _profile_ctx["n"]
+        _profile_ctx["n"] = n + 1
+        if _profile_ctx["min"] <= n < _profile_ctx["max"]:
+            profile_this_call = True
+
+    if profile_this_call:
+        e_start, e_prep, e_alloc, e_kernel, e_sync, e_topk = _mk_events(6)
+        e_start.record()
+
+    # Stage 1: input contiguous / view prep.
     q = q_index_fp8.contiguous()
-
-    # Flatten KV cache to a byte pool so the Triton kernel can address both the
-    # FP8 data region and the scale region with plain uint8 arithmetic.
-    # Shape: [num_pages * page_size * head_dim_sf] uint8.
     kv_bytes = k_index_cache_fp8.view(torch.uint8).contiguous().view(-1)
-
     w = weights.contiguous()
     bt = block_table.contiguous()
+    if profile_this_call:
+        e_prep.record()
 
-    # Allocate scores buffer. Pre-fill with -inf so any unwritten slot
-    # (early-return pages, out-of-range tail) can never win top-k.
+    # Stage 2: allocate scores buffer pre-filled with -inf.
     scores = torch.full(
         (batch_size, max_seq_len), float("-inf"),
         dtype=torch.float32, device=device,
     )
+    if profile_this_call:
+        e_alloc.record()
 
-    # Launch FP8 Tensor Core score kernel: one program per (page, batch).
+    # Stage 3: Triton FP8 Tensor Core score kernel.
     grid = (max_num_pages, batch_size)
     _fused_score_kernel[grid](
         q, kv_bytes, w, bt, seq_lens, scores,
@@ -194,11 +217,16 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
         page_size=page_size,
         head_dim_sf=head_dim_sf,
     )
+    if profile_this_call:
+        e_kernel.record()
 
-    # Top-k + index remap: still per-batch, identical to the reference.
+    # Stage 4: seq_lens.tolist() — forces ONE GPU->CPU sync.
     seq_lens_cpu = seq_lens.tolist()
     topk_indices.fill_(-1)
+    if profile_this_call:
+        e_sync.record()
 
+    # Stage 5: per-batch topk + index remap.
     for b in range(batch_size):
         seq_len = seq_lens_cpu[b]
         if seq_len == 0:
@@ -218,6 +246,26 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
         topk_tokens = global_page_idx * page_size + offset_per_token
 
         topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+
+    if profile_this_call:
+        e_topk.record()
+        torch.cuda.synchronize()
+        total = e_start.elapsed_time(e_topk)
+        t_prep = e_start.elapsed_time(e_prep)
+        t_alloc = e_prep.elapsed_time(e_alloc)
+        t_kernel = e_alloc.elapsed_time(e_kernel)
+        t_sync = e_kernel.elapsed_time(e_sync)
+        t_topk = e_sync.elapsed_time(e_topk)
+        print(
+            f"[PROFILE #{_profile_ctx['n']-1}] "
+            f"B={batch_size} max_pages={max_num_pages} "
+            f"seq_lens={seq_lens.tolist()[:4]}{'...' if batch_size > 4 else ''} "
+            f"| total={total:.3f}ms  "
+            f"prep={t_prep:.3f}  alloc={t_alloc:.3f}  "
+            f"kernel={t_kernel:.3f}  sync={t_sync:.3f}  topk={t_topk:.3f}  "
+            f"(ms)",
+            flush=True,
+        )
 
     if _DEBUG:
         _debug_diff_against_reference(

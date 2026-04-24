@@ -21,9 +21,12 @@ from flashinfer_bench import BuildSpec
 from flashinfer_bench.agents import pack_solution_from_files
 
 
-def load_config() -> dict:
-    """Load configuration from config.toml."""
-    config_path = PROJECT_ROOT / "config.toml"
+TRACK_DIRS = ["dsa_indexer", "dsa_attention", "moe"]
+
+
+def load_config(track_dir: Path) -> dict:
+    """Load configuration from <track_dir>/config.toml."""
+    config_path = track_dir / "config.toml"
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
@@ -31,9 +34,21 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
-def pack_solution(output_path: Path = None) -> Path:
-    """Pack solution files into a Solution JSON."""
-    config = load_config()
+def pack_solution(track: str, output_path: Path = None) -> Path:
+    """Pack the solution for a given track into a Solution JSON.
+
+    `track` must match one of the immediate subdirectories that contain a
+    config.toml (e.g. "dsa_indexer", "dsa_attention", "moe") — this is the
+    layout the official evaluation pipeline expects per FAQ.md.
+    """
+    track_dir = PROJECT_ROOT / track
+    if not track_dir.is_dir():
+        raise FileNotFoundError(
+            f"Track directory not found: {track_dir}. "
+            f"Valid tracks: {TRACK_DIRS}"
+        )
+
+    config = load_config(track_dir)
 
     solution_config = config["solution"]
     build_config = config["build"]
@@ -41,11 +56,11 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
+    # Determine source directory based on language (relative to the track dir).
     if language == "triton":
-        source_dir = PROJECT_ROOT / "solution" / "triton"
+        source_dir = track_dir / "solution" / "triton"
     elif language == "cuda":
-        source_dir = PROJECT_ROOT / "solution" / "cuda"
+        source_dir = track_dir / "solution" / "cuda"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -76,7 +91,7 @@ def pack_solution(output_path: Path = None) -> Path:
 
     # Write to output file
     if output_path is None:
-        output_path = PROJECT_ROOT / "solution.json"
+        output_path = PROJECT_ROOT / f"solution_{track}.json"
 
     output_path.write_text(solution.model_dump_json(indent=2))
     print(f"Solution packed: {output_path}")
@@ -94,15 +109,20 @@ def main():
 
     parser = argparse.ArgumentParser(description="Pack solution files into solution.json")
     parser.add_argument(
+        "track",
+        choices=TRACK_DIRS,
+        help=f"Which track to pack (one of: {TRACK_DIRS})",
+    )
+    parser.add_argument(
         "-o", "--output",
         type=Path,
         default=None,
-        help="Output path for solution.json (default: ./solution.json)"
+        help="Output path for solution JSON (default: ./solution_<track>.json)",
     )
     args = parser.parse_args()
 
     try:
-        pack_solution(args.output)
+        pack_solution(args.track, args.output)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

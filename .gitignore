@@ -1,5 +1,6 @@
 # FlashInfer Competition
 solution.json
+solution_*.json
 
 # CUDA build artifacts
 *.o

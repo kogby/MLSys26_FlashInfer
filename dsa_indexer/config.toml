@@ -1,0 +1,8 @@
+[solution]
+name = "JensenHireMe-dsa-indexer"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "JensenHireMe"
+
+[build]
+language = "triton"
+entry_point = "kernel_topk_indexer.py::run"

@@ -101,7 +101,8 @@ def print_results(results: dict):
 def main():
     """Pack solution and run benchmark."""
     print("Packing solution from source files...")
-    solution_path = pack_solution()
+    # Default to dsa_indexer; change to another track as needed.
+    solution_path = pack_solution("dsa_indexer")
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
