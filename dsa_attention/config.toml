@@ -1,5 +1,5 @@
 [solution]
-name = "JensenHireMe-dsa-attention"
+name = "JensenHireMe-dsa-attention-cute_v2"
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
 author = "JensenHireMe"
 
