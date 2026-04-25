@@ -1,8 +1,8 @@
 [solution]
-name = "JensenHireMe-dsa-attention-cute_v2"
+name = "JensenHireMe-dsa-attention-hybrid"
 definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
 author = "JensenHireMe"
 
 [build]
 language = "triton"
-entry_point = "kernel_cute_v2.py::run"
+entry_point = "kernel_cute_hybrid.py::run"
