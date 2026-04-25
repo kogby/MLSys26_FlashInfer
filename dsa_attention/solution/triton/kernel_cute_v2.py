@@ -12,7 +12,7 @@ Design:
                    final output + lse.
 
 Softmax: 2-pass (same as iter1 inside each split). A later iter may convert to
-single-pass online softmax — our algorithmic edge vs reference kernel3.
+single-pass online softmax.
 
 Workspace: partial_out/partial_lse allocated once, cached by (T, device).
 """

@@ -15,9 +15,6 @@ ALGORITHM (2-pass softmax, simpler for first cute iteration):
   6. OUTPUT phase: each warp takes one KV token, accumulates weight * V_row
      into per-lane register tensor (16 dims per lane).
   7. Cross-warp reduce: each thread sums 32 warps' contributions for its dim.
-
-ITER2 WILL ADD: single-pass online softmax (our algorithmic edge vs reference).
-ITER3 WILL ADD: KV-split (compute + reduce pattern, matches V4 structure).
 """
 
 import math
