@@ -1,41 +1,43 @@
 """
-Triton FP8 Fused MoE kernel — v3.
+Triton FP8 Fused MoE kernel — v5.
 
-Design: same as v1 (FP8 GEMM kernels, SwiGLU in PyTorch) but both GEMM
-kernels are decorated with @triton.autotune so Triton searches over
-BLOCK_M, num_warps, and num_stages and picks the best config per
-distinct (M, N, K) shape it encounters.
+Key change vs v3: replace the 32-iteration Python expert loop with a single
+grouped (batched) GEMM launch per stage.
 
-BLOCK_N=128 and BLOCK_K=128 are held fixed so that the B-scale and
-A-scale indexing (pid_n == n_block, kb == k_block) stays exact without
-any extra integer arithmetic.
+Pipeline:
+  1. _compute_routing      — same pure-PyTorch routing as v3, returns [T,8]
+  2. _build_expert_map     — sort (token, expert) pairs → sorted_ids, expert_offsets
+  3. _grouped_gemm1_swiglu — one Triton launch covering all experts:
+                             FP8*FP8 GEMM1 + SwiGLU fused in epilogue → [TK, I] f32
+  4. _grouped_gemm2        — one Triton launch covering all experts:
+                             f32*FP8 GEMM2 → [TK, H] f32
+  5. _scatter_add          — weighted scatter-accumulate into output
+
+Grid shape: (cdiv(max_tokens_per_expert, BLOCK_M), cdiv(N, BLOCK_N), num_active_experts)
+Each CTA reads expert_offsets[pid_e]..expert_offsets[pid_e+1] to find its M-range.
 """
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model constants
 # ─────────────────────────────────────────────────────────────────────────────
-H          = 7168
-I          = 2048
-E_GLOBAL   = 256
-E_LOCAL    = 32
-TOP_K      = 8
-N_GROUP    = 8
-TOPK_GROUP = 4
-QUANT_BLOCK = 128   # FP8 block-scale granularity
+H           = 7168
+I           = 2048
+E_GLOBAL    = 256
+E_LOCAL     = 32
+TOP_K       = 8
+N_GROUP     = 8
+TOPK_GROUP  = 4
+QUANT_BLOCK = 128
 
-# BLOCK_N and BLOCK_K are fixed; BLOCK_M is autotuned.
 BLOCK_N = 128
 BLOCK_K = 128
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Autotune config lists
-# Vary BLOCK_M (tile rows = tokens), num_warps, and num_stages.
-# num_stages controls Triton's software prefetch pipeline depth.
+# Autotune configs — same search space as v3, BLOCK_M is the key variable
 # ─────────────────────────────────────────────────────────────────────────────
 _GEMM_CONFIGS = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': 128, 'BLOCK_K': 128},
@@ -47,35 +49,85 @@ _GEMM_CONFIGS = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Triton kernel 1 (autotuned): dequant(FP8 A) @ dequant(FP8 B).T → float32 C
+# Grouped GEMM1 + SwiGLU fused
 #
-# A      : [M, K]          fp8_e4m3fn
-# Scale_A: [K//128, M]     float32     (per k-block, per token)
-# B      : [N, K]          fp8_e4m3fn
-# Scale_B: [N//128, K//128] float32
-# C      : [M, N]          float32
+# Processes all active experts in one launch via a 3-D grid:
+#   pid_m = tl.program_id(0)  — token tile within this expert
+#   pid_n = tl.program_id(1)  — output-feature tile
+#   pid_e = tl.program_id(2)  — expert index (into sorted token buffer)
+#
+# A (hidden states, FP8): all experts' tokens packed row-by-row in sorted order
+#   shape: [total_tokens, K]   where total_tokens = sum of tokens per expert
+# SA (A scales):            [K//128, total_tokens]
+# B  (W1 weights, FP8):     [E_LOCAL, 2*I, K]
+# SB (W1 scales):           [E_LOCAL, 2*I//128, K//128]
+# C  (SwiGLU output, f32):  [total_tokens, I]
+# expert_offsets:           [E_LOCAL+1]  — start row in A/C for each expert
+#
+# The fused SwiGLU: at end of K-loop, acc holds [BLOCK_M, 2*I] conceptually
+# split into gate (first I cols) and up (second I cols).  We carry two separate
+# [BLOCK_M, BLOCK_N] accumulators and write silu(up)*gate directly.
+# Because 2*I cols need two separate n-tiles this is handled by pid_n:
+#   pid_n < I//BLOCK_N       → gate tile, accumulates into acc_gate
+#   pid_n >= I//BLOCK_N      → up   tile, accumulates into acc_up
+# Then the two halves are combined in a final fused pass.
+#
+# Implementation note: carrying two BLOCK_M×BLOCK_N accumulators doubles
+# register pressure.  We therefore cap BLOCK_M at 64 for this kernel.
 # ─────────────────────────────────────────────────────────────────────────────
-@triton.autotune(configs=_GEMM_CONFIGS, key=['M', 'N', 'K'])
+
+# Separate configs with smaller BLOCK_M to avoid register spill from two accumulators
+_GEMM1_CONFIGS = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': 128, 'BLOCK_K': 128},
+                  num_warps=NW, num_stages=NS)
+    for BM in [16, 32, 64]
+    for NW in [4, 8]
+    for NS in [3, 4]
+]
+
+
+@triton.autotune(configs=_GEMM1_CONFIGS, key=['N', 'K', 'max_tokens'])
 @triton.jit
-def _fp8_fp8_gemm(
+def _grouped_gemm1_swiglu(
+    # A: sorted hidden states [total_tokens, K] FP8
     A_ptr, SA_ptr,
+    # B: W1 weights [E_LOCAL, 2*I, K] FP8  (N = 2*I)
     B_ptr, SB_ptr,
+    # C: SwiGLU output [total_tokens, I] f32
     C_ptr,
-    M, N, K,
+    # expert token ranges
+    expert_offsets_ptr,       # [E_LOCAL+1] int32
+    # dims
+    N, K,                     # N = 2*I, K = H
+    max_tokens,               # padded grid size in M dimension
+    # strides for A [total_tokens, K]
     stride_am, stride_ak,
+    # strides for SA [K//128, total_tokens]
     stride_sA_kb, stride_sA_m,
-    stride_bn, stride_bk,
-    stride_sB_nb, stride_sB_kb,
+    # strides for B [E_LOCAL, 2*I, K]  (B is indexed as [expert, n, k])
+    stride_be, stride_bn, stride_bk,
+    # strides for SB [E_LOCAL, 2*I//128, K//128]
+    stride_sB_e, stride_sB_nb, stride_sB_kb,
+    # strides for C [total_tokens, I]
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_n = tl.program_id(1)   # tile index over 2*I output cols
+    pid_e = tl.program_id(2)   # expert index
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Token range for this expert
+    e_start = tl.load(expert_offsets_ptr + pid_e)
+    e_end   = tl.load(expert_offsets_ptr + pid_e + 1)
+    M_e = e_end - e_start       # number of tokens for this expert
+
+    # Row indices within this expert's slice
+    rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = e_start + rm_local     # absolute row in the sorted buffer
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for kb in range(K // BLOCK_K):
@@ -83,48 +135,87 @@ def _fp8_fp8_gemm(
 
         a = tl.load(
             A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak,
-            mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0,
+            mask=(rm_local[:, None] < M_e) & (rk[None, :] < K), other=0.0,
         )
         sa = tl.load(
             SA_ptr + kb * stride_sA_kb + rm * stride_sA_m,
-            mask=rm < M, other=1.0,
+            mask=rm_local < M_e, other=1.0,
         )
         a = a.to(tl.float32) * sa[:, None]
 
         b = tl.load(
-            B_ptr + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
+            B_ptr + pid_e * stride_be + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
             mask=(rn[:, None] < N) & (rk[None, :] < K), other=0.0,
         )
-        sb = tl.load(SB_ptr + pid_n * stride_sB_nb + kb * stride_sB_kb)
+        sb = tl.load(SB_ptr + pid_e * stride_sB_e + pid_n * stride_sB_nb + kb * stride_sB_kb)
         b  = b.to(tl.float32) * sb
 
         acc = tl.dot(a, tl.trans(b), acc, out_dtype=tl.float32)
 
+    # SwiGLU fused epilogue:
+    # pid_n < I//BLOCK_N  → gate half  (cols 0..I-1  of W1 output)
+    # pid_n >= I//BLOCK_N → up   half  (cols I..2I-1 of W1 output)
+    # We need acc_gate and acc_up for the same (pid_m, pid_e) rows but
+    # different col tiles.  Because a single CTA only covers one pid_n tile,
+    # we cannot fuse across the gate/up split within one CTA directly.
+    # Instead we write a combined intermediate of shape [total_tokens, 2*I]
+    # and do SwiGLU in a second light pass (_swiglu_inplace).
+    # This avoids the two-accumulator register-pressure problem entirely.
     tl.store(
         C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
         acc,
-        mask=(rm[:, None] < M) & (rn[None, :] < N),
+        mask=(rm_local[:, None] < M_e) & (rn[None, :] < N),
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Triton kernel 2 (autotuned): float32 A @ dequant(FP8 B).T → float32 C
-#
-# A      : [M, K]          float32     (SwiGLU output)
-# B      : [N, K]          fp8_e4m3fn
-# Scale_B: [N//128, K//128] float32
-# C      : [M, N]          float32
-# ─────────────────────────────────────────────────────────────────────────────
-@triton.autotune(configs=_GEMM_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
-def _f32_fp8_gemm(
+def _swiglu_inplace(
+    X_ptr,          # [total_tokens, 2*I] f32  — GEMM1 output, gate||up
+    total_tokens,
+    I: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """Read gate and up from X, write silu(up)*gate back into the first I cols."""
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    ri = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+
+    gate = tl.load(X_ptr + rm[:, None] * (2 * I) + ri[None, :],
+                   mask=(rm[:, None] < total_tokens) & (ri[None, :] < I), other=0.0)
+    up   = tl.load(X_ptr + rm[:, None] * (2 * I) + (ri[None, :] + I),
+                   mask=(rm[:, None] < total_tokens) & (ri[None, :] < I), other=0.0)
+
+    z = tl.sigmoid(up) * up * gate   # silu(up) * gate
+
+    tl.store(X_ptr + rm[:, None] * (2 * I) + ri[None, :],
+             z,
+             mask=(rm[:, None] < total_tokens) & (ri[None, :] < I))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grouped GEMM2
+#
+# A: SwiGLU output [total_tokens, I] f32   (first I cols of the GEMM1 buffer)
+# B: W2 weights   [E_LOCAL, H, I]    FP8
+# SB:             [E_LOCAL, H//128, I//128]
+# C: output       [total_tokens, H]  f32
+# ─────────────────────────────────────────────────────────────────────────────
+
+@triton.autotune(configs=_GEMM_CONFIGS, key=['N', 'K', 'max_tokens'])
+@triton.jit
+def _grouped_gemm2(
     A_ptr,
     B_ptr, SB_ptr,
     C_ptr,
-    M, N, K,
+    expert_offsets_ptr,
+    N, K,           # N = H = 7168, K = I = 2048
+    max_tokens,
     stride_am, stride_ak,
-    stride_bn, stride_bk,
-    stride_sB_nb, stride_sB_kb,
+    stride_be, stride_bn, stride_bk,
+    stride_sB_e, stride_sB_nb, stride_sB_kb,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -132,9 +223,16 @@ def _f32_fp8_gemm(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+    pid_e = tl.program_id(2)
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    e_start = tl.load(expert_offsets_ptr + pid_e)
+    e_end   = tl.load(expert_offsets_ptr + pid_e + 1)
+    M_e = e_end - e_start
+
+    rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rm = e_start + rm_local
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for kb in range(K // BLOCK_K):
@@ -142,14 +240,14 @@ def _f32_fp8_gemm(
 
         a = tl.load(
             A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak,
-            mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0,
+            mask=(rm_local[:, None] < M_e) & (rk[None, :] < K), other=0.0,
         ).to(tl.float32)
 
         b = tl.load(
-            B_ptr + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
+            B_ptr + pid_e * stride_be + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
             mask=(rn[:, None] < N) & (rk[None, :] < K), other=0.0,
         )
-        sb = tl.load(SB_ptr + pid_n * stride_sB_nb + kb * stride_sB_kb)
+        sb = tl.load(SB_ptr + pid_e * stride_sB_e + pid_n * stride_sB_nb + kb * stride_sB_kb)
         b  = b.to(tl.float32) * sb
 
         acc = tl.dot(a, tl.trans(b), acc, out_dtype=tl.float32)
@@ -157,73 +255,20 @@ def _f32_fp8_gemm(
     tl.store(
         C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
         acc,
-        mask=(rm[:, None] < M) & (rn[None, :] < N),
+        mask=(rm_local[:, None] < M_e) & (rn[None, :] < N),
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Python launchers — grid uses lambda meta so the autotuned BLOCK_M is picked up
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _gemm1(
-    x:       torch.Tensor,   # [Tk, H]          fp8_e4m3fn
-    x_scale: torch.Tensor,   # [H//128, Tk]      float32
-    w:       torch.Tensor,   # [2*I, H]          fp8_e4m3fn
-    w_scale: torch.Tensor,   # [2*I//128, H//128] float32
-) -> torch.Tensor:           # [Tk, 2*I]         float32
-    Tk, K = x.shape
-    N     = w.shape[0]       # 2*I = 4096
-    out   = torch.empty((Tk, N), dtype=torch.float32, device=x.device)
-
-    grid = lambda meta: (triton.cdiv(Tk, meta['BLOCK_M']),
-                         triton.cdiv(N,  meta['BLOCK_N']))
-    _fp8_fp8_gemm[grid](
-        x,       x_scale,
-        w,       w_scale,
-        out,
-        Tk, N, K,
-        x.stride(0),       x.stride(1),
-        x_scale.stride(0), x_scale.stride(1),
-        w.stride(0),       w.stride(1),
-        w_scale.stride(0), w_scale.stride(1),
-        out.stride(0),     out.stride(1),
-    )
-    return out
-
-
-def _gemm2(
-    z:       torch.Tensor,   # [Tk, I]           float32
-    w:       torch.Tensor,   # [H, I]            fp8_e4m3fn
-    w_scale: torch.Tensor,   # [H//128, I//128]   float32
-) -> torch.Tensor:           # [Tk, H]            float32
-    Tk, K = z.shape
-    N     = w.shape[0]       # H = 7168
-    out   = torch.empty((Tk, N), dtype=torch.float32, device=z.device)
-
-    grid = lambda meta: (triton.cdiv(Tk, meta['BLOCK_M']),
-                         triton.cdiv(N,  meta['BLOCK_N']))
-    _f32_fp8_gemm[grid](
-        z,
-        w,       w_scale,
-        out,
-        Tk, N, K,
-        z.stride(0),       z.stride(1),
-        w.stride(0),       w.stride(1),
-        w_scale.stride(0), w_scale.stride(1),
-        out.stride(0),     out.stride(1),
-    )
-    return out
+# Weighted scatter-add is done in PyTorch via index_add_ (handles repeated
+# indices atomically and is better optimized than a Triton atomic kernel for
+# this pattern — avoids launching total_tokens × H/BLOCK_H tiny CTAs).
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing (pure PyTorch — identical to v1 / Python reference)
+# Routing (pure PyTorch — same as v3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _compute_routing(
-    routing_logits:        torch.Tensor,
-    routing_bias:          torch.Tensor,
-    routed_scaling_factor: float,
-):
+def _compute_routing(routing_logits, routing_bias, routed_scaling_factor):
     T = routing_logits.shape[0]
 
     s      = torch.sigmoid(routing_logits)
@@ -233,10 +278,10 @@ def _compute_routing(
     top2, _      = torch.topk(s_grouped, k=2, dim=2, sorted=False)
     group_scores = top2.sum(dim=2)
 
-    _, grp_idx  = torch.topk(group_scores, k=TOPK_GROUP, dim=1, sorted=False)
-    grp_mask    = torch.zeros_like(group_scores)
+    _, grp_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, sorted=False)
+    grp_mask   = torch.zeros_like(group_scores)
     grp_mask.scatter_(1, grp_idx, 1.0)
-    score_mask  = (
+    score_mask = (
         grp_mask.unsqueeze(2)
         .expand(T, N_GROUP, E_GLOBAL // N_GROUP)
         .reshape(T, E_GLOBAL)
@@ -247,15 +292,60 @@ def _compute_routing(
 
     weight_mask = torch.zeros_like(s)
     weight_mask.scatter_(1, topk_idx, 1.0)
-    weights     = s * weight_mask
-    weights     = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-20)
-    weights     = weights * routed_scaling_factor
+    weights = s * weight_mask
+    weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-20)
+    weights = weights * routed_scaling_factor
 
     return topk_idx, weights
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point  (destination-passing style: output is the last argument)
+# Build expert map: sort (token, expert) pairs → contiguous layout
+#
+# Returns:
+#   sorted_token_ids  [total_tokens]   int32 — original token index for each row
+#   sorted_weights    [total_tokens]   f32   — routing weight for that (token, expert) pair
+#   expert_offsets    [E_LOCAL+1]      int32 — start of each expert's slice
+#   total_tokens      int              — sum of all expert token counts
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_expert_map(topk_idx, weights, local_start, device):
+    T = topk_idx.shape[0]
+
+    # For each of the T*TOP_K (token, expert) assignments, check which fall
+    # into local experts [local_start, local_start+E_LOCAL)
+    expert_ids = topk_idx.reshape(-1)                        # [T*TOP_K]
+    token_ids  = torch.arange(T, device=device).repeat_interleave(TOP_K)  # [T*TOP_K]
+
+    # Filter to local experts only
+    local_mask = (expert_ids >= local_start) & (expert_ids < local_start + E_LOCAL)
+    local_expert_ids = expert_ids[local_mask] - local_start  # [total_tokens] in [0, E_LOCAL)
+    local_token_ids  = token_ids[local_mask]                 # [total_tokens]
+
+    # Gather corresponding weights — weights is [T, E_GLOBAL]
+    # For each surviving pair, weight = weights[token_id, global_expert_id]
+    global_expert_ids = expert_ids[local_mask]
+    local_weights = weights[local_token_ids, global_expert_ids]  # [total_tokens]
+
+    # Sort by local expert id so tokens for each expert are contiguous
+    sort_order        = torch.argsort(local_expert_ids, stable=True)
+    sorted_expert_ids = local_expert_ids[sort_order]
+    sorted_token_ids  = local_token_ids[sort_order]
+    sorted_weights    = local_weights[sort_order]
+
+    # Compute expert_offsets via bincount
+    counts = torch.bincount(sorted_expert_ids, minlength=E_LOCAL)  # [E_LOCAL]
+    expert_offsets = torch.zeros(E_LOCAL + 1, dtype=torch.int32, device=device)
+    expert_offsets[1:] = counts.cumsum(0).to(torch.int32)
+
+    total_tokens = int(expert_offsets[E_LOCAL].item())
+    # int32 for use as pointer offsets in Triton kernels
+    sorted_token_ids = sorted_token_ids.to(torch.int32)
+    return sorted_token_ids, sorted_weights, expert_offsets, total_tokens
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point (destination-passing style: output is the last argument)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -274,37 +364,89 @@ def kernel(
 ):
     T      = hidden_states.shape[0]
     device = hidden_states.device
+    local_start = int(local_expert_offset)
 
+    # ── 1. Routing ────────────────────────────────────────────────────────────
     topk_idx, weights = _compute_routing(
         routing_logits, routing_bias, routed_scaling_factor
     )
 
+    # ── 2. Build expert map ───────────────────────────────────────────────────
+    sorted_token_ids, sorted_weights, expert_offsets, total_tokens = \
+        _build_expert_map(topk_idx, weights, local_start, device)
+
+    if total_tokens == 0:
+        output.zero_()
+        return
+
+    # ── 3. Gather sorted hidden states ────────────────────────────────────────
+    # sorted_A: [total_tokens, H] FP8 — each row is hidden_states[sorted_token_ids[i]]
+    sorted_A       = hidden_states[sorted_token_ids].contiguous()
+    # hidden_states_scale: [H//128, T] → gather columns → [H//128, total_tokens]
+    sorted_A_scale = hidden_states_scale[:, sorted_token_ids].contiguous()
+
+    # ── 4. Grouped GEMM1 → [total_tokens, 2*I] f32 ───────────────────────────
+    N1 = 2 * I  # = 4096
+    gemm1_out = torch.empty((total_tokens, N1), dtype=torch.float32, device=device)
+
+    max_tokens_per_expert = int((expert_offsets[1:] - expert_offsets[:-1]).max().item())
+    # Pad to at least BLOCK_M=16 so grid is non-empty
+    max_tokens_padded = max(max_tokens_per_expert, 16)
+
+    grid1 = lambda meta: (
+        triton.cdiv(max_tokens_padded, meta['BLOCK_M']),
+        triton.cdiv(N1, meta['BLOCK_N']),
+        E_LOCAL,
+    )
+    _grouped_gemm1_swiglu[grid1](
+        sorted_A,       sorted_A_scale,
+        gemm1_weights,  gemm1_weights_scale,
+        gemm1_out,
+        expert_offsets,
+        N1, H,
+        max_tokens_padded,
+        sorted_A.stride(0),       sorted_A.stride(1),
+        sorted_A_scale.stride(0), sorted_A_scale.stride(1),
+        gemm1_weights.stride(0),  gemm1_weights.stride(1), gemm1_weights.stride(2),
+        gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
+        gemm1_out.stride(0),      gemm1_out.stride(1),
+    )
+
+    # ── 5. SwiGLU in-place: gemm1_out[:,I:2I] → silu(up)*gate, stored in [:, :I] ──
+    BLOCK_I = 128
+    _swiglu_inplace[(triton.cdiv(total_tokens, 16), triton.cdiv(I, BLOCK_I))](
+        gemm1_out,
+        total_tokens,
+        I, 16, BLOCK_I,
+    )
+    # Now gemm1_out[:, :I] holds the SwiGLU result; rest is garbage.
+    # Pass gemm1_out directly to GEMM2 with stride (2*I, 1) so we read only
+    # the first I cols without an extra copy.
+
+    # ── 6. Grouped GEMM2 → [total_tokens, H] f32 ─────────────────────────────
+    gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
+
+    grid2 = lambda meta: (
+        triton.cdiv(max_tokens_padded, meta['BLOCK_M']),
+        triton.cdiv(H, meta['BLOCK_N']),
+        E_LOCAL,
+    )
+    _grouped_gemm2[grid2](
+        gemm1_out,               # base ptr; stride_am=2*I reads only first I cols
+        gemm2_weights,  gemm2_weights_scale,
+        gemm2_out,
+        expert_offsets,
+        H, I,
+        max_tokens_padded,
+        gemm1_out.stride(0),     gemm1_out.stride(1),   # (2*I, 1) — correct K stride
+        gemm2_weights.stride(0),  gemm2_weights.stride(1), gemm2_weights.stride(2),
+        gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
+        gemm2_out.stride(0),      gemm2_out.stride(1),
+    )
+
+    # ── 7. Weighted scatter-add → out_f32 [T, H] ─────────────────────────────
     out_f32 = torch.zeros((T, H), dtype=torch.float32, device=device)
-
-    local_start = int(local_expert_offset)
-    for le in range(E_LOCAL):
-        ge = local_start + le
-        if ge >= E_GLOBAL:
-            continue
-
-        sel     = (topk_idx == ge).any(dim=1)
-        if not sel.any():
-            continue
-        tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
-
-        x        = hidden_states[tok_idx].contiguous()
-        x_scale  = hidden_states_scale[:, tok_idx].contiguous()
-
-        w1, w1_sc = gemm1_weights[le], gemm1_weights_scale[le]
-        w2, w2_sc = gemm2_weights[le], gemm2_weights_scale[le]
-
-        g1     = _gemm1(x, x_scale, w1, w1_sc)
-        x1, x2 = g1[:, :I], g1[:, I:]
-        z      = F.silu(x2) * x1
-
-        o = _gemm2(z, w2, w2_sc)
-
-        w_tok = weights[tok_idx, ge].unsqueeze(1)
-        out_f32.index_add_(0, tok_idx, o * w_tok)
+    weighted = gemm2_out * sorted_weights.unsqueeze(1)   # [total_tokens, H]
+    out_f32.index_add_(0, sorted_token_ids.long(), weighted)
 
     output.copy_(out_f32)

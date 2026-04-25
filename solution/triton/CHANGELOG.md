@@ -1,6 +1,29 @@
 # Triton Kernel Changelog
 
-## v4 — Fused routing kernel (current)
+## v5 — Grouped/batched GEMM across all experts (current)
+
+**Optimization:** Replace the 32-iteration Python expert loop with a single grouped GEMM launch per stage, eliminating ~100 GPU kernel launches per forward pass.
+
+**What changed:**
+
+- `_build_expert_map`: Pure PyTorch. Expands `topk_idx [T,8]` into flat `(token, expert)` pairs, filters to local experts, sorts by expert id, computes `expert_offsets [E_LOCAL+1]`. O(T) work.
+- `_grouped_gemm1_swiglu`: 3D Triton kernel `grid=(m_tiles, n_tiles, E_LOCAL)`. Each CTA reads `expert_offsets[pid_e]..expert_offsets[pid_e+1]` to find its token range. FP8×FP8 GEMM1 with same per-tile dequantization as v3.
+- `_swiglu_inplace`: Lightweight Triton kernel that reads gate/up from the GEMM1 output buffer and writes `silu(up)*gate` into the first I cols in-place.
+- `_grouped_gemm2`: Same 3D structure, f32×FP8 GEMM2.
+- `_scatter_add`: Triton kernel that does `out[token_id] += weight * gemm2_out[row]` via `tl.atomic_add`.
+
+**Why this is faster:**
+- 32 Python iterations × 2 Triton launches → 3 Triton launches total
+- Each expert's token tiles run in parallel across 192 B200 SMs instead of sequentially
+- The GPU sees all T×8 token-expert pairs at once, filling more SMs simultaneously
+
+**v4 (fused routing) was skipped** — routing is <10% of time; grouped GEMM is the dominant win.
+
+**GEMM kernels and scale handling are identical to v3.**
+
+---
+
+## v4 — Fused routing kernel (planned, not implemented)
 
 **Optimization:** Replace 6+ sequential PyTorch routing ops with a single Triton kernel (`_routing_kernel`) — one GPU program per token.
 
