@@ -221,32 +221,26 @@ def run(q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table, topk_ind
     if profile_this_call:
         e_kernel.record()
 
-    # Stage 4: seq_lens.tolist() — forces ONE GPU->CPU sync.
-    seq_lens_cpu = seq_lens.tolist()
-    topk_indices.fill_(-1)
+    # Stage 4: batched topk + index remap — fully on GPU, no sync, no Python loop.
+    # Padding positions in `scores` are -inf (set inside the kernel), so a single
+    # batched topk over the full [B, max_seq_len] array gives correct ordering for
+    # every batch even when seq_len < topk; trailing slots beyond seq_len are
+    # masked to -1 below.
+    # Some workloads have max_seq_len < topk; clamp k so torch.topk doesn't OOR.
     if profile_this_call:
         e_sync.record()
 
-    # Stage 5: per-batch topk + index remap.
-    for b in range(batch_size):
-        seq_len = seq_lens_cpu[b]
-        if seq_len == 0:
-            continue
+    topk_indices.fill_(-1)
+    k_eff = min(topk, max_seq_len)
+    _, topk_idx = torch.topk(scores, k=k_eff, dim=1)                 # [B, k_eff]
 
-        num_pages_for_seq = (seq_len + page_size - 1) // page_size
-        page_indices = block_table[b, :num_pages_for_seq].to(torch.long)
+    page_idx_per_token = topk_idx // page_size                       # [B, k_eff]
+    offset_per_token = topk_idx % page_size                          # [B, k_eff]
+    global_page_idx = block_table.to(torch.long).gather(1, page_idx_per_token)
+    topk_tokens = (global_page_idx * page_size + offset_per_token).to(torch.int32)
 
-        final_scores = scores[b, :seq_len]                            # [seq_len]
-
-        actual_topk = min(topk, seq_len)
-        _, topk_idx = torch.topk(final_scores, actual_topk)
-
-        page_idx_per_token = topk_idx // page_size
-        offset_per_token = topk_idx % page_size
-        global_page_idx = page_indices[page_idx_per_token]
-        topk_tokens = global_page_idx * page_size + offset_per_token
-
-        topk_indices[b, :actual_topk] = topk_tokens.to(torch.int32)
+    valid_mask = torch.arange(k_eff, device=device) < seq_lens.unsqueeze(1)
+    topk_indices[:, :k_eff] = torch.where(valid_mask, topk_tokens, torch.full_like(topk_tokens, -1))
 
     if profile_this_call:
         e_topk.record()

@@ -5,4 +5,4 @@ author = "JensenHireMe"
 
 [build]
 language = "triton"
-entry_point = "kernel_topk_indexer.py::run"
+entry_point = "kernel_topk_indexer_submit.py::run"

@@ -67,6 +67,10 @@ image = (
         # `cutlass.cute` for CuTe-DSL kernels). Harmless if unused by
         # dsa_indexer / moe tracks.
         "nvidia-cutlass-dsl",
+        # Required ONLY when running --use-official-baseline (the dsa_indexer
+        # baseline solution `flashinfer_deepgemm_wrapper_*.json` calls these at
+        # runtime). Submission code must NOT import these — see FAQ.md L166-170.
+        "flashinfer-python",
     )
     # IMPORTANT: install flashinfer-bench FROM SOURCE. The PyPI release is
     # older than 2026-04-10 and lacks the DsaTopkIndexerEvaluator (PR #354)
@@ -75,6 +79,11 @@ image = (
     .run_commands(
         "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
         "cd /opt/flashinfer-bench && pip install -v -e .",
+        # deep_gemm is not on PyPI; install from DeepSeek's GitHub. Only needed
+        # for --use-official-baseline (same FAQ caveat as flashinfer above).
+        # Disabled: upstream metadata-generation fails on Modal build. Re-enable
+        # (and pin a known-good commit) when running --use-official-baseline.
+        # "pip install git+https://github.com/deepseek-ai/DeepGEMM.git",
     )
 )
 
