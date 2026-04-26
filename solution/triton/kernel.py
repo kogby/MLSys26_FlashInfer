@@ -1,20 +1,18 @@
 """
-Triton FP8 Fused MoE kernel — v5.
+Triton FP8 Fused MoE kernel — v7 (autotune fix)
 
-Key change vs v3: replace the 32-iteration Python expert loop with a single
-grouped (batched) GEMM launch per stage.
+v7 vs v5.1: fixes _GEMM1_CONFIGS which incorrectly capped BLOCK_M at 64.
+_grouped_gemm1_swiglu has a single accumulator (SwiGLU is a separate
+_swiglu_inplace pass), so BLOCK_M=128 is safe. Also adds num_stages=5 to
+both GEMM config grids, and bumps _swiglu_inplace BLOCK_M from 16→32.
 
 Pipeline:
-  1. _compute_routing      — same pure-PyTorch routing as v3, returns [T,8]
-  2. _build_expert_map     — sort (token, expert) pairs → sorted_ids, expert_offsets
-  3. _grouped_gemm1_swiglu — one Triton launch covering all experts:
-                             FP8*FP8 GEMM1 + SwiGLU fused in epilogue → [TK, I] f32
-  4. _grouped_gemm2        — one Triton launch covering all experts:
-                             f32*FP8 GEMM2 → [TK, H] f32
-  5. _scatter_add          — weighted scatter-accumulate into output
-
-Grid shape: (cdiv(max_tokens_per_expert, BLOCK_M), cdiv(N, BLOCK_N), num_active_experts)
-Each CTA reads expert_offsets[pid_e]..expert_offsets[pid_e+1] to find its M-range.
+  1. _compute_routing      — pure-PyTorch routing, returns [T,8] indices+weights
+  2. _build_expert_map     — sort (token,expert) pairs → sorted_ids, expert_offsets
+  3. _grouped_gemm1_swiglu — FP8×FP8→float32, writes [total_tokens, 2*I]
+  4. _swiglu_inplace       — silu(up)*gate in-place → [total_tokens, I] in first I cols
+  5. _grouped_gemm2        — float32×FP8→float32, reads first I cols via stride trick
+  6. index_add_            — weighted scatter into output
 """
 
 import torch
@@ -44,45 +42,17 @@ _GEMM_CONFIGS = [
                   num_warps=NW, num_stages=NS)
     for BM in [16, 32, 64, 128]
     for NW in [4, 8]
-    for NS in [3, 4]
+    for NS in [3, 4, 5]
 ]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Grouped GEMM1 + SwiGLU fused
-#
-# Processes all active experts in one launch via a 3-D grid:
-#   pid_m = tl.program_id(0)  — token tile within this expert
-#   pid_n = tl.program_id(1)  — output-feature tile
-#   pid_e = tl.program_id(2)  — expert index (into sorted token buffer)
-#
-# A (hidden states, FP8): all experts' tokens packed row-by-row in sorted order
-#   shape: [total_tokens, K]   where total_tokens = sum of tokens per expert
-# SA (A scales):            [K//128, total_tokens]
-# B  (W1 weights, FP8):     [E_LOCAL, 2*I, K]
-# SB (W1 scales):           [E_LOCAL, 2*I//128, K//128]
-# C  (SwiGLU output, f32):  [total_tokens, I]
-# expert_offsets:           [E_LOCAL+1]  — start row in A/C for each expert
-#
-# The fused SwiGLU: at end of K-loop, acc holds [BLOCK_M, 2*I] conceptually
-# split into gate (first I cols) and up (second I cols).  We carry two separate
-# [BLOCK_M, BLOCK_N] accumulators and write silu(up)*gate directly.
-# Because 2*I cols need two separate n-tiles this is handled by pid_n:
-#   pid_n < I//BLOCK_N       → gate tile, accumulates into acc_gate
-#   pid_n >= I//BLOCK_N      → up   tile, accumulates into acc_up
-# Then the two halves are combined in a final fused pass.
-#
-# Implementation note: carrying two BLOCK_M×BLOCK_N accumulators doubles
-# register pressure.  We therefore cap BLOCK_M at 64 for this kernel.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Separate configs with smaller BLOCK_M to avoid register spill from two accumulators
+# GEMM1 has a single accumulator (SwiGLU is handled by a separate _swiglu_inplace
+# pass, not two in-register accumulators), so full BLOCK_M range is safe.
 _GEMM1_CONFIGS = [
     triton.Config({'BLOCK_M': BM, 'BLOCK_N': 128, 'BLOCK_K': 128},
                   num_warps=NW, num_stages=NS)
-    for BM in [16, 32, 64]
+    for BM in [16, 32, 64, 128]
     for NW in [4, 8]
-    for NS in [3, 4]
+    for NS in [3, 4, 5]
 ]
 
 
@@ -414,10 +384,11 @@ def kernel(
 
     # ── 5. SwiGLU in-place: gemm1_out[:,I:2I] → silu(up)*gate, stored in [:, :I] ──
     BLOCK_I = 128
-    _swiglu_inplace[(triton.cdiv(total_tokens, 16), triton.cdiv(I, BLOCK_I))](
+    SWIGLU_BLOCK_M = 32
+    _swiglu_inplace[(triton.cdiv(total_tokens, SWIGLU_BLOCK_M), triton.cdiv(I, BLOCK_I))](
         gemm1_out,
         total_tokens,
-        I, 16, BLOCK_I,
+        I, SWIGLU_BLOCK_M, BLOCK_I,
     )
     # Now gemm1_out[:, :I] holds the SwiGLU result; rest is garbage.
     # Pass gemm1_out directly to GEMM2 with stride (2*I, 1) so we read only

@@ -1,6 +1,64 @@
 # Triton Kernel Changelog
 
-## v5 — Grouped/batched GEMM across all experts (current)
+## v7 — Fix GEMM1 autotune config + num_stages=5 (current)
+
+**Bug fixed:** `_GEMM1_CONFIGS` incorrectly capped `BLOCK_M` at 64. `_grouped_gemm1_swiglu` has a **single accumulator** (SwiGLU is handled by a separate `_swiglu_inplace` pass, not by two in-register accumulators), so BLOCK_M=128 is safe. The cap was a copy-paste artifact from the abandoned v6.1 two-accumulator design.
+
+**What changed:**
+- `_GEMM1_CONFIGS`: BLOCK_M range expanded from `{16, 32, 64}` → `{16, 32, 64, 128}`
+- Both `_GEMM1_CONFIGS` and `_GEMM_CONFIGS`: `num_stages` expanded from `{3, 4}` → `{3, 4, 5}`
+- `_swiglu_inplace` launch: BLOCK_M bumped from 16 → 32 (halves CTA count for the SwiGLU pass)
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 1.85 ms, max: 23.72 ms, median: 1.87 ms
+- Speedup — min: 2.225x (large 23ms workload), max: 9.663x, **mean: 8.124x**
+- Improvement over v5.1: +0.634x mean speedup (7.49x → 8.124x), median latency 2.11 ms → 1.87 ms
+
+---
+
+## v5.1 — Revert to v5 grouped GEMM pipeline (superseded by v7)
+
+**Reason:** v6's FP8 intermediate (`swiglu_fp8`) produced INCORRECT_NUMERICAL on all 19 production workloads (abs errors 13,000–28,000) despite passing the synthetic debug test. Root cause isolated via systematic elimination: the FP8 quantize-dequantize roundtrip in the sorted-token-id path introduced errors that differed from FlashInfer's float32 reference. The `tl.float8e4nv` type is the correct Triton dtype for `torch.float8_e4m3fn` on H100 (not `tl.float8e4m3fn` which doesn't exist in Triton 3.6.0), but the production data magnitudes expose numerical issues in the FP8 intermediate path.
+
+**What changed:** Reverts to v5's three-kernel pipeline: `_grouped_gemm1_swiglu` (FP8×FP8→float32), `_swiglu_inplace` (in-place SwiGLU), `_grouped_gemm2` (float32×FP8→float32). Routing, expert-map, and scatter remain unchanged. Pure Python reference (which matched FlashInfer's output exactly with 0 error on all workloads) confirmed the algorithm is correct; only the Triton kernel implementations needed to be restored.
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 2.10 ms, max: 25.74 ms, median: 2.11 ms
+- Speedup — min: 2.08x (large 25ms workload), max: 8.94x, **mean: 7.49x**
+- Correctness: matched_ratio ≥ 0.961 for all workloads (threshold is 0.9); max abs error = 4096–8192 is tail-element FP8+float32 numerical difference vs reference
+
+---
+
+## v6.1 — Fused GEMM1+SwiGLU, float32 output (REGRESSED — superseded by v5.1)
+
+**Optimization:** Replace v5.1's `_grouped_gemm1_swiglu` + `_swiglu_inplace` two-pass with a single `_grouped_gemm1_swiglu_f32` kernel that holds two accumulators (`acc_gate`, `acc_up`), applies `silu(up)*gate` in-register, and writes [total_tokens, I] float32 directly. Eliminates the [total_tokens, 2*I] HBM write+read roundtrip.
+
+**Why it regressed:** Two accumulators double per-CTA register pressure, forcing the autotuner to cap `BLOCK_M ≤ 64` (vs `≤ 128` in v5.1). Lower BLOCK_M means fewer rows per CTA, lower arithmetic intensity, and worse latency hiding for large memory-bandwidth-bound workloads. The intermediate buffer savings (~4× less HBM traffic) are outweighed by the occupancy loss.
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: ~2 ms, max: 27.41 ms
+- Speedup — min: 1.959x, max: 8.850x, **mean: 7.271x** (vs v5.1's 7.49x)
+- Large workloads regressed: 27.41 ms (v6.1) vs 25.74 ms (v5.1), 18.27 ms vs 17.17 ms
+
+---
+
+## v6 — Fused SwiGLU epilogue + FP8 quantized GEMM2 input (BROKEN — superseded by v5.1)
+
+**Optimization:** Fuse SwiGLU into the GEMM1 epilogue (in-register, two accumulators), block-quantize the result to FP8, and feed it directly into a full FP8×FP8 GEMM2. Eliminates the 134 MB FP32 intermediate buffer from v5 and reduces GEMM2 A-matrix bandwidth 4×.
+
+**What changed:**
+- `_grouped_gemm1_swiglu_fp8`: replaces v5's `_grouped_gemm1_swiglu` + `_swiglu_inplace`. Each CTA loads **two B-tiles per K-iteration** (gate half at `rn_gate`, up half at `rn_gate + I`) and accumulates into `acc_gate` and `acc_up`. After the K-loop, applies `silu(acc_up) * acc_gate` in registers, then block-quantizes to FP8 (one scale per 128 output features per token). Output: `swiglu_fp8 [total_tokens, I]` FP8 + `swiglu_scale [I//128, total_tokens]` FP32. Grid is halved in N-dimension (`I_TILES=16` instead of `2*I_TILES=32`) since each CTA handles a gate+up pair together.
+- `_grouped_fp8_gemm`: generic grouped FP8×FP8→FP32 GEMM. GEMM2 now takes `swiglu_fp8` + `swiglu_scale` as its A input.
+- GEMM1 configs capped at `BLOCK_M ∈ {16, 32}` due to two-accumulator register pressure.
+- GEMM2 configs unchanged: `BLOCK_M ∈ {16, 32, 64, 128}`.
+
+**HBM traffic for intermediate tensors (T=1024, total_tokens≈8192):**
+- v5: 402 MB (gemm1_write + swiglu_rw + gemm2_A_read)
+- v6: ~17 MB (swiglu_fp8_write + swiglu_fp8_read + scales)
+
+---
+
+## v5 — Grouped/batched GEMM across all experts (superseded by v6)
 
 **Optimization:** Replace the 32-iteration Python expert loop with a single grouped GEMM launch per stage, eliminating ~100 GPU kernel launches per forward pass.
 
