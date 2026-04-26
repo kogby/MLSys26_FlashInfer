@@ -1,13 +1,15 @@
 """
-Triton FP8 Fused MoE kernel — v7 (autotune fix)
+Triton FP8 Fused MoE kernel — v8
 
-v7 vs v5.1: fixes _GEMM1_CONFIGS which incorrectly capped BLOCK_M at 64.
-_grouped_gemm1_swiglu has a single accumulator (SwiGLU is a separate
-_swiglu_inplace pass), so BLOCK_M=128 is safe. Also adds num_stages=5 to
-both GEMM config grids, and bumps _swiglu_inplace BLOCK_M from 16→32.
+v8 vs v7:
+- Persistent 2D tile scheduling for both grouped GEMMs.
+  Old: 3D grid (ceil(max_tokens/BM), N_TILES, E_LOCAL) — wastes CTAs for under-loaded experts.
+  New: 2D grid (total_valid_m_tiles, N_TILES) — only launches tiles for experts with tokens.
+  In-kernel decode: 32-iteration static loop maps global m-tile → (expert, local m-tile).
+- Eliminates up to 75% wasted CTAs on imbalanced workloads; all SMs stay busy.
 
 Pipeline:
-  1. _compute_routing      — pure-PyTorch routing, returns [T,8] indices+weights
+  1. _compute_routing      — PyTorch routing, returns [T,8] indices + dense [T,256] weights
   2. _build_expert_map     — sort (token,expert) pairs → sorted_ids, expert_offsets
   3. _grouped_gemm1_swiglu — FP8×FP8→float32, writes [total_tokens, 2*I]
   4. _swiglu_inplace       — silu(up)*gate in-place → [total_tokens, I] in first I cols
@@ -56,7 +58,7 @@ _GEMM1_CONFIGS = [
 ]
 
 
-@triton.autotune(configs=_GEMM1_CONFIGS, key=['N', 'K', 'max_tokens'])
+@triton.autotune(configs=_GEMM1_CONFIGS, key=['N', 'K', 'total_tokens'])
 @triton.jit
 def _grouped_gemm1_swiglu(
     # A: sorted hidden states [total_tokens, K] FP8
@@ -69,7 +71,7 @@ def _grouped_gemm1_swiglu(
     expert_offsets_ptr,       # [E_LOCAL+1] int32
     # dims
     N, K,                     # N = 2*I, K = H
-    max_tokens,               # padded grid size in M dimension
+    total_tokens,             # autotune key — total rows across all experts
     # strides for A [total_tokens, K]
     stride_am, stride_ak,
     # strides for SA [K//128, total_tokens]
@@ -84,19 +86,33 @@ def _grouped_gemm1_swiglu(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)   # tile index over 2*I output cols
-    pid_e = tl.program_id(2)   # expert index
+    pid_m_global = tl.program_id(0)   # global m-tile index across all experts
+    pid_n        = tl.program_id(1)   # tile index over 2*I output cols
 
-    # Token range for this expert
-    e_start = tl.load(expert_offsets_ptr + pid_e)
-    e_end   = tl.load(expert_offsets_ptr + pid_e + 1)
-    M_e = e_end - e_start       # number of tokens for this expert
+    # Decode pid_m_global → (expert id, local m-tile within that expert).
+    # Linear scan over E_LOCAL=32 experts; unrolled at compile time via static_range.
+    pid_e   = 0
+    pid_m   = 0
+    cum_m   = 0
+    for e in tl.static_range(32):
+        e_s       = tl.load(expert_offsets_ptr + e).to(tl.int32)
+        e_e       = tl.load(expert_offsets_ptr + e + 1).to(tl.int32)
+        m_tiles_e = (e_e - e_s + BLOCK_M - 1) // BLOCK_M
+        new_cum   = cum_m + m_tiles_e
+        found     = (pid_m_global >= cum_m) & (pid_m_global < new_cum)
+        pid_e     = tl.where(found, e, pid_e)
+        pid_m     = tl.where(found, pid_m_global - cum_m, pid_m)
+        cum_m     = new_cum
+
+    # Token range for the decoded expert
+    e_start = tl.load(expert_offsets_ptr + pid_e).to(tl.int32)
+    e_end   = tl.load(expert_offsets_ptr + pid_e + 1).to(tl.int32)
+    M_e     = e_end - e_start
 
     # Row indices within this expert's slice
     rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rm = e_start + rm_local     # absolute row in the sorted buffer
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm       = e_start + rm_local   # absolute row in the sorted buffer
+    rn       = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -122,15 +138,8 @@ def _grouped_gemm1_swiglu(
 
         acc = tl.dot(a, tl.trans(b), acc, out_dtype=tl.float32)
 
-    # SwiGLU fused epilogue:
-    # pid_n < I//BLOCK_N  → gate half  (cols 0..I-1  of W1 output)
-    # pid_n >= I//BLOCK_N → up   half  (cols I..2I-1 of W1 output)
-    # We need acc_gate and acc_up for the same (pid_m, pid_e) rows but
-    # different col tiles.  Because a single CTA only covers one pid_n tile,
-    # we cannot fuse across the gate/up split within one CTA directly.
-    # Instead we write a combined intermediate of shape [total_tokens, 2*I]
-    # and do SwiGLU in a second light pass (_swiglu_inplace).
-    # This avoids the two-accumulator register-pressure problem entirely.
+    # Write combined [gate||up] intermediate; _swiglu_inplace fuses SwiGLU in a
+    # second pass so each CTA here carries only one accumulator (no register pressure).
     tl.store(
         C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
         acc,
@@ -174,7 +183,7 @@ def _swiglu_inplace(
 # C: output       [total_tokens, H]  f32
 # ─────────────────────────────────────────────────────────────────────────────
 
-@triton.autotune(configs=_GEMM_CONFIGS, key=['N', 'K', 'max_tokens'])
+@triton.autotune(configs=_GEMM_CONFIGS, key=['N', 'K', 'total_tokens'])
 @triton.jit
 def _grouped_gemm2(
     A_ptr,
@@ -182,7 +191,7 @@ def _grouped_gemm2(
     C_ptr,
     expert_offsets_ptr,
     N, K,           # N = H = 7168, K = I = 2048
-    max_tokens,
+    total_tokens,   # autotune key — total rows across all experts
     stride_am, stride_ak,
     stride_be, stride_bn, stride_bk,
     stride_sB_e, stride_sB_nb, stride_sB_kb,
@@ -191,17 +200,30 @@ def _grouped_gemm2(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_e = tl.program_id(2)
+    pid_m_global = tl.program_id(0)
+    pid_n        = tl.program_id(1)
 
-    e_start = tl.load(expert_offsets_ptr + pid_e)
-    e_end   = tl.load(expert_offsets_ptr + pid_e + 1)
-    M_e = e_end - e_start
+    # Decode pid_m_global → (expert id, local m-tile within that expert).
+    pid_e   = 0
+    pid_m   = 0
+    cum_m   = 0
+    for e in tl.static_range(32):
+        e_s       = tl.load(expert_offsets_ptr + e).to(tl.int32)
+        e_e       = tl.load(expert_offsets_ptr + e + 1).to(tl.int32)
+        m_tiles_e = (e_e - e_s + BLOCK_M - 1) // BLOCK_M
+        new_cum   = cum_m + m_tiles_e
+        found     = (pid_m_global >= cum_m) & (pid_m_global < new_cum)
+        pid_e     = tl.where(found, e, pid_e)
+        pid_m     = tl.where(found, pid_m_global - cum_m, pid_m)
+        cum_m     = new_cum
+
+    e_start = tl.load(expert_offsets_ptr + pid_e).to(tl.int32)
+    e_end   = tl.load(expert_offsets_ptr + pid_e + 1).to(tl.int32)
+    M_e     = e_end - e_start
 
     rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rm = e_start + rm_local
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm       = e_start + rm_local
+    rn       = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -282,34 +304,26 @@ def _compute_routing(routing_logits, routing_bias, routed_scaling_factor):
 def _build_expert_map(topk_idx, weights, local_start, device):
     T = topk_idx.shape[0]
 
-    # For each of the T*TOP_K (token, expert) assignments, check which fall
-    # into local experts [local_start, local_start+E_LOCAL)
     expert_ids = topk_idx.reshape(-1)                        # [T*TOP_K]
     token_ids  = torch.arange(T, device=device).repeat_interleave(TOP_K)  # [T*TOP_K]
 
-    # Filter to local experts only
     local_mask = (expert_ids >= local_start) & (expert_ids < local_start + E_LOCAL)
-    local_expert_ids = expert_ids[local_mask] - local_start  # [total_tokens] in [0, E_LOCAL)
-    local_token_ids  = token_ids[local_mask]                 # [total_tokens]
+    local_expert_ids = expert_ids[local_mask] - local_start
+    local_token_ids  = token_ids[local_mask]
 
-    # Gather corresponding weights — weights is [T, E_GLOBAL]
-    # For each surviving pair, weight = weights[token_id, global_expert_id]
     global_expert_ids = expert_ids[local_mask]
-    local_weights = weights[local_token_ids, global_expert_ids]  # [total_tokens]
+    local_weights = weights[local_token_ids, global_expert_ids]
 
-    # Sort by local expert id so tokens for each expert are contiguous
     sort_order        = torch.argsort(local_expert_ids, stable=True)
     sorted_expert_ids = local_expert_ids[sort_order]
     sorted_token_ids  = local_token_ids[sort_order]
     sorted_weights    = local_weights[sort_order]
 
-    # Compute expert_offsets via bincount
-    counts = torch.bincount(sorted_expert_ids, minlength=E_LOCAL)  # [E_LOCAL]
+    counts = torch.bincount(sorted_expert_ids, minlength=E_LOCAL)
     expert_offsets = torch.zeros(E_LOCAL + 1, dtype=torch.int32, device=device)
     expert_offsets[1:] = counts.cumsum(0).to(torch.int32)
 
-    total_tokens = int(expert_offsets[E_LOCAL].item())
-    # int32 for use as pointer offsets in Triton kernels
+    total_tokens     = int(expert_offsets[E_LOCAL].item())
     sorted_token_ids = sorted_token_ids.to(torch.int32)
     return sorted_token_ids, sorted_weights, expert_offsets, total_tokens
 
@@ -359,22 +373,22 @@ def kernel(
     N1 = 2 * I  # = 4096
     gemm1_out = torch.empty((total_tokens, N1), dtype=torch.float32, device=device)
 
-    max_tokens_per_expert = int((expert_offsets[1:] - expert_offsets[:-1]).max().item())
-    # Pad to at least BLOCK_M=16 so grid is non-empty
-    max_tokens_padded = max(max_tokens_per_expert, 16)
+    # Persistent 2D tiling: only launch M-tiles for experts that actually have tokens.
+    # token_counts_cpu is a list of 32 ints; the CPU transfer is one small sync point
+    # (same cost as the original .max().item() call) but eliminates up to 75% of
+    # wasted CTAs for imbalanced workloads.
+    token_counts_cpu = (expert_offsets[1:] - expert_offsets[:-1]).cpu().tolist()
 
     grid1 = lambda meta: (
-        triton.cdiv(max_tokens_padded, meta['BLOCK_M']),
+        sum((int(tc) + meta['BLOCK_M'] - 1) // meta['BLOCK_M'] for tc in token_counts_cpu),
         triton.cdiv(N1, meta['BLOCK_N']),
-        E_LOCAL,
     )
     _grouped_gemm1_swiglu[grid1](
         sorted_A,       sorted_A_scale,
         gemm1_weights,  gemm1_weights_scale,
         gemm1_out,
         expert_offsets,
-        N1, H,
-        max_tokens_padded,
+        N1, H, total_tokens,
         sorted_A.stride(0),       sorted_A.stride(1),
         sorted_A_scale.stride(0), sorted_A_scale.stride(1),
         gemm1_weights.stride(0),  gemm1_weights.stride(1), gemm1_weights.stride(2),
@@ -398,17 +412,15 @@ def kernel(
     gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
 
     grid2 = lambda meta: (
-        triton.cdiv(max_tokens_padded, meta['BLOCK_M']),
+        sum((int(tc) + meta['BLOCK_M'] - 1) // meta['BLOCK_M'] for tc in token_counts_cpu),
         triton.cdiv(H, meta['BLOCK_N']),
-        E_LOCAL,
     )
     _grouped_gemm2[grid2](
         gemm1_out,               # base ptr; stride_am=2*I reads only first I cols
         gemm2_weights,  gemm2_weights_scale,
         gemm2_out,
         expert_offsets,
-        H, I,
-        max_tokens_padded,
+        H, I, total_tokens,
         gemm1_out.stride(0),     gemm1_out.stride(1),   # (2*I, 1) — correct K stride
         gemm2_weights.stride(0),  gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),

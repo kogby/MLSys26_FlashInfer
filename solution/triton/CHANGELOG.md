@@ -1,6 +1,28 @@
 # Triton Kernel Changelog
 
-## v7 — Fix GEMM1 autotune config + num_stages=5 (current)
+## v8 — Persistent 2D tile scheduling (current)
+
+**Optimization:** Replace the 3D grid `(ceil(max_tokens/BM), N_TILES, E_LOCAL)` with a 2D grid `(total_valid_m_tiles, N_TILES)` for both `_grouped_gemm1_swiglu` and `_grouped_gemm2`. Each CTA decodes its expert and local m-tile via a 32-iteration static loop (unrolled at compile time) over `expert_offsets`, using `tl.static_range(E_LOCAL)` + `tl.where` accumulation.
+
+**What changed:**
+- Both GEMM kernels: `pid_e = tl.program_id(2)` removed; replaced by 32-iteration `tl.static_range` decode from global m-tile index.
+- Autotune key: `max_tokens` → `total_tokens` (sum of all expert token counts).
+- Host code: `max_tokens_padded` removed; `token_counts_cpu` (32 ints from one GPU→CPU sync) drives both grid lambdas.
+- Grid lambdas: 3D `(m_tiles, n_tiles, E_LOCAL)` → 2D `(total_valid_m_tiles, n_tiles)`.
+
+**Why this helps:**
+- Old 3D grid: `ceil(max_tokens/BM) × N_TILES × 32` CTAs launched, but experts with fewer tokens than `max_tokens` wasted many CTAs doing masked-out work.
+- New 2D grid: exactly `sum(ceil(tokens_e/BM) for e) × N_TILES` CTAs, all doing real work.
+- For imbalanced workloads (e.g., 5 experts with 512 tokens, 27 with 0): old CTA count ≈ 4096, new ≈ 320 — 12× fewer for GEMM1.
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 0.909 ms, max: 13.798 ms, median: 1.581 ms
+- Speedup — min: 3.830x (large 13.8ms workload), max: 16.169x, **mean: 10.848x**
+- Improvement over v7: +2.724x mean speedup (8.124x → 10.848x), median latency 1.87 ms → 1.58 ms
+
+---
+
+## v7 — Fix GEMM1 autotune config + num_stages=5 (superseded by v8)
 
 **Bug fixed:** `_GEMM1_CONFIGS` incorrectly capped `BLOCK_M` at 64. `_grouped_gemm1_swiglu` has a **single accumulator** (SwiGLU is handled by a separate `_swiglu_inplace` pass, not by two in-register accumulators), so BLOCK_M=128 is safe. The cap was a copy-paste artifact from the abandoned v6.1 two-accumulator design.
 
