@@ -1,6 +1,47 @@
 # Triton Kernel Changelog
 
-## v8 — Persistent 2D tile scheduling (current)
+## v10 — FP8 tensor cores for GEMM1 (current, best)
+
+**Optimization:** In `_grouped_gemm1_swiglu`, stop pre-converting A,B from FP8 to float32 before `tl.dot`. Instead: `partial = tl.dot(fp8_A, fp8_B_T, out_dtype=float32)`, then `acc += partial * sa[:,None] * sb`. This is mathematically identical (sa,sb are K-block-constant scalars that can factor out of the sum), but routes through H100/H200 FP8 WMMA tensor cores (3.9–4.9 PFLOP/s) instead of float32 SIMD (0.98–1.5 PFLOP/s).
+
+GEMM2 is unchanged from v8 (float32 A × FP8 B). BF16 tensor cores for GEMM2 were tried and caused matched_ratio < threshold on production workloads: SwiGLU outputs can reach O(1000+), and BF16's 7-bit mantissa introduces ~5-7% of elements outside (atol=1, rtol=0.3).
+
+**Why the large workloads improve most:** For total_tokens≈65k, GEMM1 was compute-bound at FP32 (3.92ms compute vs 0.74ms memory floor). FP8 tensor cores reduce compute time to ~0.98ms, making GEMM1 memory-bandwidth-limited. Net saving: ~3ms per large workload.
+
+**Results (19 workloads, all PASSED on H200):**
+- Latency — min: 1.293 ms, max: 9.065 ms, median: 1.569 ms
+- Speedup — min: 5.800x (large 9.1ms workload), max: 11.956x, **mean: 10.945x**
+- Large workload improvement: 5e8dc11c 3.84x→5.80x (+51%), 58a34f27 4.35x→6.43x (+48%)
+- Note: run on H200 (H200 has higher reference FlashInfer throughput, so medium-workload speedups are lower than H100 numbers; large-workload improvement is genuine)
+
+---
+
+## v9 experiments — All regressed vs v8 (abandoned)
+
+## v8 — Persistent 2D tile scheduling (superseded by v10)
+
+## v9 experiments — All regressed vs v8 (abandoned)
+
+Three v9 variants were tried; all were slower than v8. v8 remains the active implementation.
+
+**v9a — Fused `_grouped_gemm2_fused` + SwiGLU + weighted atomic scatter:**
+- Kernel reads gate+up tiles from `gemm1_out`, applies SwiGLU in-register, then `tl.atomic_add` directly into `out_f32`.
+- Correctness bug (50.6% pass ratio): `tl.atomic_add` + `@triton.autotune` accumulates across ~3000 autotune trials. Fixed by `reset_to_zero=['Out_ptr']`.
+- Performance after fix: mean **9.432x** — regression. Root cause: scattered atomic writes from 8 concurrent expert CTAs cause L2 cache line serialization. Large workload (13.8ms → 17.7ms, +28% slower).
+
+**v9b — `_grouped_gemm2_swiglu`: SwiGLU fused into GEMM2 A-tile loads, `tl.store` epilogue:**
+- Reads gate (cols [0, K)) and up (cols [I, I+K)) from `gemm1_out` per K-iteration, applies `silu(up)*gate` in-register. Eliminates `_swiglu_inplace` (~1 GB HBM saved).
+- Performance: mean **8.981x** — regression. Root cause: loading 2× A tiles per K-iteration doubles A-side HBM pressure in GEMM2, disrupting the autotuner into smaller BLOCK_M configs.
+
+**v9c — Weight multiply fused into GEMM2 epilogue:**
+- GEMM2 loads `sorted_weights[rm]` in the epilogue and stores `acc * w[:, None]` instead of `acc`. Eliminates the separate `weighted = gemm2_out * sorted_weights` tensor (~3.76 GB HBM traffic saved for large workloads).
+- Performance: mean **9.703x** — regression. Root cause: materializing `acc * w[:, None]` before `tl.store` doubles epilogue register usage, reducing occupancy and causing the autotuner to select smaller BLOCK_M for medium workloads.
+
+**Lesson:** Adding computation to GEMM2 (whether SwiGLU, atomic scatter, or weight multiply) consistently reduces the autotuner's effective BLOCK_M and hurts throughput more than the HBM savings gained.
+
+---
+
+## v8 — Persistent 2D tile scheduling
 
 **Optimization:** Replace the 3D grid `(ceil(max_tokens/BM), N_TILES, E_LOCAL)` with a 2D grid `(total_valid_m_tiles, N_TILES)` for both `_grouped_gemm1_swiglu` and `_grouped_gemm2`. Each CTA decodes its expert and local m-tile via a 32-iteration static loop (unrolled at compile time) over `expert_offsets`, using `tl.static_range(E_LOCAL)` + `tl.where` accumulation.
 

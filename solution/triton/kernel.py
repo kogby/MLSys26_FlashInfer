@@ -1,20 +1,22 @@
 """
-Triton FP8 Fused MoE kernel — v8
+Triton FP8 Fused MoE kernel — v10
 
-v8 vs v7:
-- Persistent 2D tile scheduling for both grouped GEMMs.
-  Old: 3D grid (ceil(max_tokens/BM), N_TILES, E_LOCAL) — wastes CTAs for under-loaded experts.
-  New: 2D grid (total_valid_m_tiles, N_TILES) — only launches tiles for experts with tokens.
-  In-kernel decode: 32-iteration static loop maps global m-tile → (expert, local m-tile).
-- Eliminates up to 75% wasted CTAs on imbalanced workloads; all SMs stay busy.
+v10 vs v8:
+- GEMM1: Pass FP8 A,B directly to tl.dot (FP8 tensor cores, up to 4× over FP32).
+  Block scales applied after the dot: acc += dot(fp8_A, fp8_B_T) * sa[:,None] * sb.
+- GEMM2: unchanged from v8 (float32 A × FP8 B, dequant before tl.dot).
+  BF16 tensor cores for GEMM2 caused matched_ratio < threshold on production workloads
+  (SwiGLU outputs reach O(1000+), BF16 7-bit mantissa introduces ~5-7% element errors).
+- No change to intermediate buffer shapes, host code, or kernel signatures.
 
 Pipeline:
-  1. _compute_routing      — PyTorch routing, returns [T,8] indices + dense [T,256] weights
-  2. _build_expert_map     — sort (token,expert) pairs → sorted_ids, expert_offsets
-  3. _grouped_gemm1_swiglu — FP8×FP8→float32, writes [total_tokens, 2*I]
-  4. _swiglu_inplace       — silu(up)*gate in-place → [total_tokens, I] in first I cols
-  5. _grouped_gemm2        — float32×FP8→float32, reads first I cols via stride trick
-  6. index_add_            — weighted scatter into output
+  1. _compute_routing         — PyTorch routing, returns [T,8] indices + dense [T,256] weights
+  2. _build_expert_map        — sort (token,expert) pairs → sorted_ids, expert_offsets
+  3. _grouped_gemm1_swiglu    — FP8×FP8→float32 (FP8 tensor cores), writes [total_tokens, 2*I]
+  4. _swiglu_inplace          — applies silu(up)*gate into first I cols of gemm1_out
+  5. _grouped_gemm2           — float32×FP8→float32, writes [total_tokens, H]
+  6. weighted scatter          — gemm2_out * weights → index_add_ into out_f32 [T, H]
+  7. output.copy_(out_f32)    — float32 → bfloat16 cast
 """
 
 import torch
@@ -127,16 +129,15 @@ def _grouped_gemm1_swiglu(
             SA_ptr + kb * stride_sA_kb + rm * stride_sA_m,
             mask=rm_local < M_e, other=1.0,
         )
-        a = a.to(tl.float32) * sa[:, None]
-
         b = tl.load(
             B_ptr + pid_e * stride_be + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
             mask=(rn[:, None] < N) & (rk[None, :] < K), other=0.0,
         )
         sb = tl.load(SB_ptr + pid_e * stride_sB_e + pid_n * stride_sB_nb + kb * stride_sB_kb)
-        b  = b.to(tl.float32) * sb
 
-        acc = tl.dot(a, tl.trans(b), acc, out_dtype=tl.float32)
+        # FP8 × FP8 → float32 using FP8 tensor cores; apply block scales after.
+        partial = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
+        acc = acc + partial * sa[:, None] * sb
 
     # Write combined [gate||up] intermediate; _swiglu_inplace fuses SwiGLU in a
     # second pass so each CTA here carries only one accumulator (no register pressure).
@@ -249,11 +250,6 @@ def _grouped_gemm2(
         acc,
         mask=(rm_local[:, None] < M_e) & (rn[None, :] < N),
     )
-
-
-# Weighted scatter-add is done in PyTorch via index_add_ (handles repeated
-# indices atomically and is better optimized than a Triton atomic kernel for
-# this pattern — avoids launching total_tokens × H/BLOCK_H tiny CTAs).
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,19 +392,12 @@ def kernel(
         gemm1_out.stride(0),      gemm1_out.stride(1),
     )
 
-    # ── 5. SwiGLU in-place: gemm1_out[:,I:2I] → silu(up)*gate, stored in [:, :I] ──
-    BLOCK_I = 128
-    SWIGLU_BLOCK_M = 32
-    _swiglu_inplace[(triton.cdiv(total_tokens, SWIGLU_BLOCK_M), triton.cdiv(I, BLOCK_I))](
-        gemm1_out,
-        total_tokens,
-        I, SWIGLU_BLOCK_M, BLOCK_I,
-    )
-    # Now gemm1_out[:, :I] holds the SwiGLU result; rest is garbage.
-    # Pass gemm1_out directly to GEMM2 with stride (2*I, 1) so we read only
-    # the first I cols without an extra copy.
+    # ── 5. SwiGLU in-place on gemm1_out (first I cols) ───────────────────────
+    _swiglu_inplace[
+        (triton.cdiv(total_tokens, 32), triton.cdiv(I, 128))
+    ](gemm1_out, total_tokens, I=I, BLOCK_M=32, BLOCK_I=128)
 
-    # ── 6. Grouped GEMM2 → [total_tokens, H] f32 ─────────────────────────────
+    # ── 6. Grouped GEMM2 → gemm2_out [total_tokens, H] ───────────────────────
     gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
 
     grid2 = lambda meta: (
@@ -416,20 +405,18 @@ def kernel(
         triton.cdiv(H, meta['BLOCK_N']),
     )
     _grouped_gemm2[grid2](
-        gemm1_out,               # base ptr; stride_am=2*I reads only first I cols
-        gemm2_weights,  gemm2_weights_scale,
+        gemm1_out,
+        gemm2_weights, gemm2_weights_scale,
         gemm2_out,
         expert_offsets,
         H, I, total_tokens,
-        gemm1_out.stride(0),     gemm1_out.stride(1),   # (2*I, 1) — correct K stride
+        gemm1_out.stride(0),      gemm1_out.stride(1),
         gemm2_weights.stride(0),  gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         gemm2_out.stride(0),      gemm2_out.stride(1),
     )
 
-    # ── 7. Weighted scatter-add → out_f32 [T, H] ─────────────────────────────
-    out_f32 = torch.zeros((T, H), dtype=torch.float32, device=device)
-    weighted = gemm2_out * sorted_weights.unsqueeze(1)   # [total_tokens, H]
+    weighted = gemm2_out * sorted_weights.unsqueeze(1)
+    out_f32  = torch.zeros((T, H), dtype=torch.float32, device=device)
     out_f32.index_add_(0, sorted_token_ids.long(), weighted)
-
     output.copy_(out_f32)
