@@ -1,6 +1,67 @@
 # Triton Kernel Changelog
 
-## v17 — Triton prefix-sum + fused gather in GEMM1 (current)
+## v18 — Fuse expert counting into routing kernel (current)
+
+**Optimization:** Merge `_count_expert_tokens` into `_routing_kernel`, eliminating one kernel launch and the `cuLaunchKernel` gap between them visible in the Nsight Systems timeline.
+
+**Why this is safe:**
+At the end of routing, `topk_idx_arr` (8 × int32) is still live in registers — each thread already knows exactly which experts it selected. The old `_count_expert_tokens` kernel would re-launch T CTAs, load those same values back from global memory via `tl.load(topk_idx_ptr + pid*8 + k)`, and do 8 atomic adds. The fused version skips the global-memory round-trip entirely:
+
+```python
+# topk_idx_arr still in registers — extract each element with a register reduce
+for k in tl.static_range(8):
+    eid      = tl.sum(tl.where(k_ids == k, topk_idx_arr, 0)).to(tl.int32)
+    lid      = eid - local_start
+    is_local = (lid >= 0) & (lid < 32)
+    tl.atomic_add(expert_counts_ptr + tl.where(is_local, lid, 0), 1, mask=is_local)
+```
+
+`tl.sum(tl.where(k_ids == k, topk_idx_arr, 0))` with `k` a `static_range` constexpr is resolved entirely in registers at compile time — no memory traffic.
+
+**Why `_prefix_sum` and `_scatter_sorted_tokens` cannot be similarly merged:**
+Both require a **grid-wide synchronisation** barrier: prefix_sum must see all T tokens' counts before computing offsets, and scatter must see all 32 offsets before any token can write its slot. These barriers require CUDA cooperative kernels (`cudaLaunchCooperativeKernel` + `grid.sync()`), which Triton does not expose. The minimum achievable pipeline in Triton remains 3 kernels for this stage.
+
+**Pipeline after v18 (7 kernels total, down from 8):**
+```
+_routing_kernel (fused count) → _prefix_sum → _scatter_sorted_tokens
+→ _grouped_gemm1_swiglu (fused gather) → _swiglu_to_fp16_scaled
+→ _grouped_gemm2 → _weighted_output
+```
+
+**Results (19 workloads, all PASSED):**
+
+| Workload | Latency (ms) | Speedup | abs_err |
+|---|---|---|---|
+| 1a4c6ba1 | 0.8445 | 85.830x | 4.08e+05 |
+| 2e69caee | 0.2424 | 67.464x | 2.05e+03 |
+| 4822167c | 0.5798 | 39.492x | 2.05e+03 |
+| 58a34f27 | 4.7385 | 15.992x | 5.57e+05 |
+| 5e8dc11c | 11.2911 | 8.363x | 4.59e+05 |
+| 5eadab1e | 0.4805 | 45.053x | 2.05e+03 |
+| 6230e838 | 0.5079 | 41.048x | 4.10e+03 |
+| 74d7ff04 | 0.5829 | 39.748x | 2.05e+03 |
+| 76010cb4 | 0.5934 | 38.131x | 2.05e+03 |
+| 81955b1e | 0.5481 | 39.235x | 4.10e+03 |
+| 8cba5890 | 0.3587 | 49.995x | 2.05e+03 |
+| 8f1ff9f1 | 0.6421 | 33.271x | 2.05e+03 |
+| a7c2bcfd | 0.3678 | 49.262x | 2.05e+03 |
+| b8f4f012 | 0.2803 | 61.488x | 2.05e+03 |
+| e05c6c03 | 0.2252 | 70.319x | 1.02e+03 |
+| e626d3e6 | 0.5901 | 40.072x | 4.10e+03 |
+| eedc63b2 | 0.4927 | 44.152x | 4.10e+03 |
+| f7d6ac7c | 0.4453 | 46.505x | 2.05e+03 |
+| fc378037 | 0.5591 | 39.427x | 3.07e+03 |
+
+**Summary:**
+- Latency — min: 0.2252 ms, max: 11.2911 ms, median: 0.5481 ms
+- Speedup — min: 8.363x, max: 85.830x, **mean: 44.992x**
+- **+11% vs v17** (40.559x → 44.992x mean speedup)
+- Small/medium workloads improve consistently: `e05c6c03` 67.469x → 70.319x, `1a4c6ba1` 29.559x → 85.830x
+- **`5e8dc11c` regressed** (11.682x → 8.363x, 4.75 ms → 11.29 ms): the additional 8 atomic_add operations per CTA increase register pressure on the routing kernel, likely reducing occupancy for large-T workloads where the routing kernel is a larger fraction of total time. Worth investigating with a separate counting kernel re-enabled for large T.
+
+---
+
+## v17 — Triton prefix-sum + fused gather in GEMM1 (superseded by v18)
 
 **Optimization:** Close two CPU-GPU synchronization bubbles visible in the routing-stage timeline (confirmed via Nsight Systems: both CPU and GPU idle between kernel launches).
 
