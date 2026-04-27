@@ -1,5 +1,21 @@
 # Triton Kernel Changelog
 
+## v17-old — N-stream chunk pipelining (REVERTED — regression)
+
+**Idea:** Split T tokens into CHUNK_SIZE=256-token chunks and run each on its own CUDA stream (capped at MAX_STREAMS=8). At T_c=256, GEMMs are small enough that concurrent streams could overlap chunk N+1's routing with chunk N's GEMM.
+
+**Why it didn't work:** The GEMM weight matrices (944MB each, FP8) must be re-read from HBM once per chunk. With 8 chunks, weight traffic increases 8×. At T_c=256 the A-to-B memory ratio is 3.6MB : 944MB (262:1), making each small GEMM extremely B-dominated. The extra weight HBM traffic costs more than routing-overlap saves. Results (19/19 PASS):
+
+| Variant | Mean speedup | Notes |
+|---|---|---|
+| Uncapped (8 streams always) | 28.853x | Large-T workloads badly hurt (7x) |
+| Threshold (8 streams for T≤2048) | 28.201x | Large-T recovered but small-T slightly worse |
+| v16 baseline | **30.532x** | Best overall |
+
+**Conclusion:** Routing kernels (~50µs) are too small relative to GEMMs (~750µs) for pipeline overlap to offset the weight-reread cost. Reverted to v16.
+
+---
+
 ## v16 — Token-parallel gather kernel replaces index_add_ (current)
 
 **Optimization:** Replace the 4-op scatter path (mul + zeros + index_add_ + copy_) at the end of each forward pass with a single fused Triton gather kernel.
