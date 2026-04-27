@@ -1,6 +1,22 @@
 # Triton Kernel Changelog
 
-## v10 — FP8 tensor cores for GEMM1 (current, best)
+## v11 — Fused routing Triton kernels + counting sort (current, best)
+
+**Optimization:** Replace PyTorch `_compute_routing` (13+ ops, dense `weights[T,256]` tensor) and `_build_expert_map` (`argsort` + `bincount`, 2 CPU syncs) with three Triton kernels and one merged CPU sync.
+
+- `_routing_kernel` (one CTA/token): sigmoid+bias → group top-2 sums → top-4 groups → top-8 argmax rounds → normalize. Outputs `topk_idx[T,8]` int32 + `topk_weights[T,8]` f32. Eliminates `weights[T,256]` (32× larger than needed; only 8/256 entries non-zero per token).
+- `_count_expert_tokens` (one CTA/token): `tl.atomic_add` per local expert → `expert_counts[E_LOCAL]`. O(T·TOP_K) vs O(T·E_GLOBAL) for the old `bincount`.
+- `_scatter_sorted_tokens` (one CTA/token): atomic write-cursor per expert → sorted layout without `argsort`. O(T) vs O(T log T).
+- CPU syncs: 2 → 1 (one `.cpu()` transfers all 33 offset ints at once via PCIe).
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 0.468 ms, max: 8.682 ms, median: 0.926 ms
+- Speedup — min: 6.201x (large workload), max: 32.128x, **mean: 20.598x**
+- Compared to v10 (H100 baseline), small/medium workloads improved ~2× due to routing overhead elimination (~270µs routing overhead at T=2048 → ~20µs).
+
+---
+
+## v10 — FP8 tensor cores for GEMM1
 
 **Optimization:** In `_grouped_gemm1_swiglu`, stop pre-converting A,B from FP8 to float32 before `tl.dot`. Instead: `partial = tl.dot(fp8_A, fp8_B_T, out_dtype=float32)`, then `acc += partial * sa[:,None] * sb`. This is mathematically identical (sa,sb are K-block-constant scalars that can factor out of the sum), but routes through H100/H200 FP8 WMMA tensor cores (3.9–4.9 PFLOP/s) instead of float32 SIMD (0.98–1.5 PFLOP/s).
 
