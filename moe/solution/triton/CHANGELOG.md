@@ -1,6 +1,23 @@
 # Triton Kernel Changelog
 
-## v11 — Fused routing Triton kernels + counting sort (current, best)
+## v12 — Zero CPU-sync via persistent workspace + fixed GEMM grids (current)
+
+**Optimization:** Eliminate the remaining CPU sync (`.cpu()` call between steps 3 and 4) by pre-allocating all output buffers once per unique batch size T.
+
+- `_ws_cache`: module-level dict keyed by `(T, device)`. Allocated once, reused on every subsequent call. Holds `sorted_token_ids[gcap]`, `sorted_weights[gcap]`, `gemm1_out[gcap, 2I]`, `gemm2_out[gcap, H]` where `gcap = 2*T`.
+- Zero-weight invariant: `sorted_weights.zero_()` at the start of each call ensures positions `[total_tokens, gcap)` have weight 0. So `gemm2_out[invalid] * 0 = 0` and `index_add_` of zero is a no-op — invalid workspace rows contribute nothing to output.
+- Fixed GEMM grids: `triton.cdiv(gcap, BLOCK_M) + E_LOCAL` instead of `sum(tc//BM for tc in token_counts_cpu)`. The `+ E_LOCAL` is mathematically required: `cum_m ≤ total_tokens/BM + E_LOCAL` (each expert adds at most 1 partial tile), so grid must be at least `ceil(gcap/BM) + E_LOCAL` to guarantee all tiles are covered regardless of routing skew. Over-launched CTAs hit an early-exit guard (`if pid_m_global >= cum_m: return`) and exit after ~32 loads.
+- Per-call allocations: 7 `torch.empty/zeros` → 3 `zero_()` GPU ops (near-zero latency).
+- GPU idle gap eliminated: routing → count → cumsum → scatter → GEMM1 now flows without CPU blocking.
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 0.372 ms, max: 9.704 ms, median: 0.850 ms
+- Speedup — min: 5.486x (large workload), max: 39.746x, **mean: 22.199x**
+- +1.6x vs v11 on small/medium workloads (routing overhead + CPU sync eliminated)
+
+---
+
+## v11 — Fused routing Triton kernels + counting sort
 
 **Optimization:** Replace PyTorch `_compute_routing` (13+ ops, dense `weights[T,256]` tensor) and `_build_expert_map` (`argsort` + `bincount`, 2 CPU syncs) with three Triton kernels and one merged CPU sync.
 
