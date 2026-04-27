@@ -1,5 +1,5 @@
 """
-Run your Triton/CUDA kernel on Modal B200 and get speedup vs FlashInfer baseline.
+Run your Triton/CUDA kernel on Modal and get speedup vs FlashInfer baseline.
 
 All flashinfer_bench work happens inside the Modal container (Linux). The local
 side only reads source files and the per-track config.toml — no flashinfer_bench
@@ -11,12 +11,16 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 
 Usage:
-    modal run scripts/run_modal.py --track moe [OPTIONS]
+    modal run scripts/run_modal.py --track <track> [OPTIONS]
+
+    GPU defaults to B200:1; override with MODAL_GPU env var, e.g.:
+        MODAL_GPU=H100:1 modal run scripts/run_modal.py --track moe
 
 Options:
     --track TEXT                 [required] Track subdirectory (containing
-                                 config.toml). One of:
-                                 dsa_indexer | dsa_attention | moe.
+                                 config.toml). Discovered dynamically — any
+                                 immediate subdirectory of the project root
+                                 with a config.toml works.
 
     --debug / --no-debug         Sets FIB_DEBUG=1/0 in the container. Kernels
                                  that support it (e.g. dsa_indexer) re-run the
@@ -36,6 +40,7 @@ Options:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +53,10 @@ except ImportError:
     import tomli as tomllib
 
 import modal
+
+# GPU is resolved at module-load time because @app.function decorators consume
+# it eagerly. Set MODAL_GPU=H100:1 (or any spec Modal accepts) to override.
+MODAL_GPU = os.environ.get("MODAL_GPU", "B200:1")
 
 app = modal.App("flashinfer-bench")
 
@@ -75,7 +84,7 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu=MODAL_GPU, timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def pack_and_run(
     sources: dict,
     config: dict,
@@ -178,12 +187,23 @@ def pack_and_run(
     return results
 
 
+def _discover_tracks() -> list[str]:
+    """List immediate subdirs of PROJECT_ROOT that contain a config.toml."""
+    return sorted(
+        p.name for p in PROJECT_ROOT.iterdir()
+        if p.is_dir() and (p / "config.toml").exists()
+    )
+
+
 def _load_track_sources(track: str) -> tuple[dict, dict]:
     """Read <track>/config.toml and gather source files. Local-only, no flashinfer-bench."""
     track_dir = PROJECT_ROOT / track
     config_path = track_dir / "config.toml"
     if not config_path.exists():
-        raise FileNotFoundError(f"Track config not found: {config_path}")
+        available = _discover_tracks()
+        raise FileNotFoundError(
+            f"Track config not found: {config_path}. Available tracks: {available}"
+        )
 
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
@@ -271,7 +291,7 @@ def main(
     print(f"Loading sources for track '{track}'...")
     sources, config = _load_track_sources(track)
     print(f"Sending {len(sources)} file(s) to Modal: {list(sources.keys())}")
-    print("Running on Modal B200...")
+    print(f"Running on Modal {MODAL_GPU}...")
 
     workload_limit = max_workloads if max_workloads and max_workloads > 0 else None
     results = pack_and_run.remote(
