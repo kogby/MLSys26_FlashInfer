@@ -1,31 +1,36 @@
 """
-Triton FP8 Fused MoE kernel — v16
+Triton FP8 Fused MoE kernel — v17
 
-v16 replaces index_add_ scatter with a token-parallel gather kernel.
+v17 closes two CPU-GPU synchronization bubbles visible in the routing stage:
 
-v15 (previous):
-- FP16 GEMM2 with overflow-safe A-side scaling (per-row × per-128-K-block).
-- Zero CPU syncs via persistent workspace (v12).
+  Gap 1 (after _count_expert_tokens, before _scatter_sorted_tokens):
+    Old: ws['expert_offsets'][1:] = ws['expert_counts'].cumsum(0).to(torch.int32)
+         ws['write_ptrs'].copy_(ws['expert_offsets'][:-1])
+    Three separate PyTorch dispatch round-trips (aten::cumsum, aten::to,
+    aten::copy_) for only 32 elements, each stalling the CUDA command queue.
+    New: single `_prefix_sum[(1,)](...)` Triton kernel — one CTA, 32 threads,
+    computes exclusive prefix sum in registers and writes both offsets and
+    write_ptrs in one shot.
 
-v16 (this version):
-- Step 9 was 4 ops (mul + zeros + index_add_ + copy_) costing ~343µs for
-  T=2048, dominated by index_add_: a scatter with random writes that breaks
-  memory coalescing and requires atomics for duplicate token IDs.
-- `_scatter_sorted_tokens` now also fills `token_slot_map[T, TOP_K]`: for
-  each top-k assignment that lands on a local expert, stores the workspace
-  slot index. Non-local entries retain the gcap sentinel.
-- New `_weighted_output` kernel: grid=(T, H//128), one CTA per (token, column
-  block). Iterates k=0..7, reads gemm2_out[slot, :] and sorted_weights[slot],
-  accumulates in float32, writes bfloat16 directly to output. No intermediates,
-  no atomics, coalesced writes. Estimated memory traffic: 557MB → 87MB.
+  Gap 2 (after _scatter_sorted_tokens, before _grouped_gemm1_swiglu):
+    Old: sorted_A       = hidden_states[ws['sorted_token_ids']].contiguous()
+         sorted_A_scale = hidden_states_scale[:, ws['sorted_token_ids']].contiguous()
+    Two aten::index fancy-gather kernels allocating [gcap, H] and [H//128, gcap]
+    tensors. Fused into _grouped_gemm1_swiglu via a new `token_ids_ptr`
+    argument: each CTA loads tok = sorted_token_ids[rm] once before the K-loop,
+    then reads hidden_states[tok, :] and hidden_states_scale[kb, tok] directly.
+    Zero extra allocation, zero extra kernels.
+
+v16 (previous):
+- Token-parallel _weighted_output gather replaces index_add_ scatter.
 
 Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — Triton; [T,8] indices + weights
   2. _count_expert_tokens    — Triton; expert token counts
-  3. GPU cumsum (no CPU sync) — expert_offsets [E_LOCAL+1]
+  3. _prefix_sum             — Triton; expert_offsets [E_LOCAL+1] + write_ptrs
   4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
                                token_slot_map
-  5. _grouped_gemm1_swiglu   — FP8×FP8→float32 (FP8 tensor cores)
+  5. _grouped_gemm1_swiglu   — FP8×FP8→float32 with inline token gather
   6. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
   7. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
   8. _weighted_output        — gather gemm2_out via slot_map → bf16 output
@@ -106,26 +111,28 @@ _GEMM1_CONFIGS = [
 @triton.autotune(configs=_GEMM1_CONFIGS, key=['N', 'K', 'total_tokens'])
 @triton.jit
 def _grouped_gemm1_swiglu(
-    # A: sorted hidden states [total_tokens, K] FP8
+    # token_ids: sorted_token_ids [total_tokens] int32 — maps workspace slot → original token row
+    token_ids_ptr,
+    # A: raw hidden states [T, K] FP8  (NOT pre-gathered; indexed via token_ids)
     A_ptr, SA_ptr,
     # B: W1 weights [E_LOCAL, 2*I, K] FP8  (N = 2*I)
     B_ptr, SB_ptr,
-    # C: SwiGLU output [total_tokens, I] f32
+    # C: GEMM1 output [total_tokens, 2*I] f32
     C_ptr,
     # expert token ranges
     expert_offsets_ptr,       # [E_LOCAL+1] int32
     # dims
     N, K,                     # N = 2*I, K = H
     total_tokens,             # autotune key — total rows across all experts
-    # strides for A [total_tokens, K]
+    # strides for A [T, K]
     stride_am, stride_ak,
-    # strides for SA [K//128, total_tokens]
+    # strides for SA [K//128, T]
     stride_sA_kb, stride_sA_m,
     # strides for B [E_LOCAL, 2*I, K]
     stride_be, stride_bn, stride_bk,
     # strides for SB [E_LOCAL, 2*I//128, K//128]
     stride_sB_e, stride_sB_nb, stride_sB_kb,
-    # strides for C [total_tokens, I]
+    # strides for C [total_tokens, 2*I]
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -158,17 +165,26 @@ def _grouped_gemm1_swiglu(
     rm       = e_start + rm_local
     rn       = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    # ── Inline gather: resolve workspace slots → original token row indices ──
+    # Loaded once here, outside the K-loop, replacing the pre-kernel aten::index
+    # that materialized the full [gcap, H] sorted_A tensor.
+    # Out-of-bounds slots (rm_local >= M_e) load token 0 — harmless since those
+    # rows are masked out at the store below.
+    tok = tl.load(token_ids_ptr + rm, mask=rm_local < M_e, other=0)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for kb in range(K // BLOCK_K):
         rk = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
+        # Index into raw hidden_states[tok, :] instead of pre-gathered sorted_A[rm, :]
         a = tl.load(
-            A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak,
+            A_ptr + tok[:, None] * stride_am + rk[None, :] * stride_ak,
             mask=(rm_local[:, None] < M_e) & (rk[None, :] < K), other=0.0,
         )
+        # Index into raw hidden_states_scale[kb, tok] instead of sorted_A_scale[kb, rm]
         sa = tl.load(
-            SA_ptr + kb * stride_sA_kb + rm * stride_sA_m,
+            SA_ptr + kb * stride_sA_kb + tok * stride_sA_m,
             mask=rm_local < M_e, other=1.0,
         )
         b = tl.load(
@@ -423,6 +439,33 @@ def _count_expert_tokens(
 
 
 @triton.jit
+def _prefix_sum(
+    counts_ptr,      # [E_LOCAL] int32 — token counts per local expert
+    offsets_ptr,     # [E_LOCAL+1] int32 — output: exclusive prefix (offsets[0]=0 pre-zeroed)
+    write_ptrs_ptr,  # [E_LOCAL] int32 — output: same exclusive prefix (scatter cursors)
+    E: tl.constexpr,
+):
+    """Single-CTA exclusive prefix sum over E_LOCAL=32 expert counts.
+
+    Replaces three separate PyTorch ops (aten::cumsum + aten::to + aten::copy_)
+    with one Triton kernel dispatch.  E=32 fits in a single warp — the entire
+    computation lives in registers with no shared-memory traffic.
+
+    On exit:
+        offsets[0]   = 0                        (written by caller's zero_())
+        offsets[1:E+1] = cumsum(counts)[0:E]    (inclusive → stored at +1 offset)
+        write_ptrs[i] = offsets[i]              = exclusive prefix at position i
+    """
+    idx = tl.arange(0, E)               # [0..E-1], all in one warp for E=32
+    c   = tl.load(counts_ptr + idx)     # [E_LOCAL] int32 counts
+    cs  = tl.cumsum(c, axis=0)          # inclusive prefix sum in registers
+    # offsets[1..E] = cs  (offsets[0]=0 already written by expert_offsets.zero_())
+    tl.store(offsets_ptr + 1 + idx, cs.to(tl.int32))
+    # write_ptrs[i] = exclusive prefix = cs[i] - c[i]
+    tl.store(write_ptrs_ptr + idx, (cs - c).to(tl.int32))
+
+
+@triton.jit
 def _scatter_sorted_tokens(
     topk_idx_ptr,          # [T, 8] int32
     topk_weights_ptr,      # [T, 8] f32
@@ -537,9 +580,13 @@ def kernel(
         ws['topk_idx'], ws['expert_counts'], local_start, T,
     )
 
-    # ── 3. GPU prefix sum (no CPU sync) ──────────────────────────────────────
-    ws['expert_offsets'][1:] = ws['expert_counts'].cumsum(0).to(torch.int32)
-    ws['write_ptrs'].copy_(ws['expert_offsets'][:-1])
+    # ── 3. Triton prefix sum (replaces aten::cumsum + aten::to + aten::copy_) ──
+    # Single CTA, 32 threads — computes exclusive prefix sum in registers and
+    # writes both expert_offsets[1:] and write_ptrs in one kernel launch.
+    # offsets[0] is already 0 from the expert_offsets.zero_() above.
+    _prefix_sum[(1,)](
+        ws['expert_counts'], ws['expert_offsets'], ws['write_ptrs'], E=E_LOCAL,
+    )
 
     # ── 4. Scatter tokens into sorted layout (Triton, 1 kernel) ──────────────
     _scatter_sorted_tokens[(T,)](
@@ -549,11 +596,12 @@ def kernel(
         local_start, T,
     )
 
-    # ── 5. Gather sorted hidden states (gcap rows; invalid rows read row 0) ──
-    sorted_A       = hidden_states[ws['sorted_token_ids']].contiguous()
-    sorted_A_scale = hidden_states_scale[:, ws['sorted_token_ids']].contiguous()
+    # ── 5. (removed) — gather fused into GEMM1 via inline token_ids indexing ──
 
-    # ── 6. Grouped GEMM1 → [gcap, 2*I] f32 ──────────────────────────────────
+    # ── 6. Grouped GEMM1 with inline gather → [gcap, 2*I] f32 ───────────────
+    # hidden_states [T, H] and hidden_states_scale [H//128, T] are passed raw;
+    # GEMM1 resolves workspace slot → token row via sorted_token_ids internally,
+    # eliminating the two aten::index + contiguous() calls from v16.
     N1 = 2 * I
     # Grid M-dim: ceil(gcap/BM) + E_LOCAL.
     # cum_m <= total_tokens/BM + E_LOCAL (each expert adds at most 1 partial tile),
@@ -563,16 +611,17 @@ def kernel(
         triton.cdiv(N1, meta['BLOCK_N']),
     )
     _grouped_gemm1_swiglu[grid1](
-        sorted_A,       sorted_A_scale,
-        gemm1_weights,  gemm1_weights_scale,
+        ws['sorted_token_ids'],                         # token_ids (new first arg)
+        hidden_states,          hidden_states_scale,    # A raw [T,H], SA [H//128,T]
+        gemm1_weights,          gemm1_weights_scale,
         ws['gemm1_out'],
         ws['expert_offsets'],
         N1, H, gcap,
-        sorted_A.stride(0),       sorted_A.stride(1),
-        sorted_A_scale.stride(0), sorted_A_scale.stride(1),
-        gemm1_weights.stride(0),  gemm1_weights.stride(1), gemm1_weights.stride(2),
-        gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
-        ws['gemm1_out'].stride(0), ws['gemm1_out'].stride(1),
+        hidden_states.stride(0),        hidden_states.stride(1),
+        hidden_states_scale.stride(0),  hidden_states_scale.stride(1),
+        gemm1_weights.stride(0),        gemm1_weights.stride(1),  gemm1_weights.stride(2),
+        gemm1_weights_scale.stride(0),  gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
+        ws['gemm1_out'].stride(0),      ws['gemm1_out'].stride(1),
     )
 
     # ── 7. SwiGLU + per-row × per-128-K-block FP16 quantization ──────────────
