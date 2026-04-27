@@ -1,6 +1,48 @@
 # Triton Kernel Changelog
 
-## v15 — Per-row × per-128-K-block A-side scaling for FP16 GEMM2 (current)
+## v16 — Token-parallel gather kernel replaces index_add_ (current)
+
+**Optimization:** Replace the 4-op scatter path (mul + zeros + index_add_ + copy_) at the end of each forward pass with a single fused Triton gather kernel.
+
+**Why index_add_ was slow (profiler, T=2048):**
+- `aten::mul` 98µs — writes a full `[gcap=4096, H=7168]` = 117MB intermediate (`weighted`) to HBM
+- `aten::zeros` 17µs — allocates+zeros a `[T, H]` = 59MB `out_f32` buffer every call
+- `aten::index_add_` 228µs — scatter-add with random writes (breaks memory coalescing) and atomics for tokens that land on multiple local experts
+- `aten::copy_` 5µs — float32 → bfloat16 cast
+- Total: ~348µs, ~20% of CUDA time, ~557MB memory traffic
+
+**The fix — two changes:**
+
+1. `_scatter_sorted_tokens` now also fills `token_slot_map[T, TOP_K]`. For each top-k assignment that lands on a local expert, the atomic-add position (`pos`) is stored back into `token_slot_map[t, k]`. Non-local entries retain the `gcap` sentinel (initialized once per call via `fill_(gcap)`).
+
+2. New `_weighted_output` kernel: grid = `(T, H // 128)`. Each CTA owns one (output token, 128-column block). It iterates `k = 0..7`, checks `slot_map[t, k] < gcap`, loads `gemm2_out[slot, :]` and `sorted_weights[slot]`, accumulates in float32, and stores bfloat16 directly to `output`. **No intermediates, no atomics, coalesced writes.**
+
+**Memory traffic:**
+
+| | v15 | v16 |
+|---|---|---|
+| Intermediates written | 176MB | 0 |
+| gemm2_out reads | 234MB (read twice: mul + index_add_) | ~58MB (read once per slot) |
+| Output writes | 88MB (59MB f32 + 29MB bf16) | 29MB bf16 |
+| **Total** | **~557MB** | **~87MB** |
+
+**Results (19 workloads, all PASSED on H100):**
+- Latency — min: 0.360 ms, max: 5.017 ms, median: 0.646 ms
+- Speedup — min: 10.909x, max: 43.248x, **mean: 30.532x**
+- **+37% vs v15** (22.199x → 30.532x mean speedup)
+- `_weighted_output`: 90µs (vs 348µs for the 4-op scatter path) — **3.9× faster for this step**
+- Total CUDA time: 9.4ms per call (vs ~17ms in v15)
+
+**Profiler breakdown (T=2048, v16):**
+- `_grouped_gemm1_swiglu`: 42.6% (402µs)
+- `_grouped_gemm2`: 35.9% (339µs)
+- `_weighted_output`: 9.5% (90µs)
+- `_swiglu_to_fp16_scaled`: 3.0% (28µs)
+- `_routing_kernel`: 2.8% (26µs)
+
+---
+
+## v15 — Per-row × per-128-K-block A-side scaling for FP16 GEMM2
 
 **Why:** v14 wrote raw `z.to(fp16)` for the SwiGLU output and routed GEMM2 through FP16 tensor cores. SwiGLU values reach O(1000s+) on a small fraction of (token, K-block) tiles, and those overflow FP16's 65504 max → Inf → INCORRECT_NUMERICAL on **13 / 19** workloads on the bench. Per-row × per-128-K-block scaling on the A side fixes the overflow without touching the FP16 tensor-core fast path.
 

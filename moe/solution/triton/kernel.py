@@ -1,42 +1,34 @@
 """
-Triton FP8 Fused MoE kernel — v15
+Triton FP8 Fused MoE kernel — v16
 
-v15 merges two independent optimizations:
+v16 replaces index_add_ scatter with a token-parallel gather kernel.
 
-v12 (zero CPU syncs, Ethan):
-- Pre-allocate all workspace buffers keyed by (T, device); sorted_weights
-  zeroed each call → invalid entries contribute 0 to output.
-- Fixed GEMM grids use gcap=2*T instead of token_counts_cpu (no CPU sync).
-- Early-exit guard in GEMM kernels handles over-launched CTAs gracefully.
-- Per-call allocations: 7 → 3 zero_() GPU ops (near-zero cost).
-- GPU idle gap eliminated: routing → count → cumsum → scatter → GEMM1
-  flows without CPU blocking.
+v15 (previous):
+- FP16 GEMM2 with overflow-safe A-side scaling (per-row × per-128-K-block).
+- Zero CPU syncs via persistent workspace (v12).
 
-v14/v15 (FP16 GEMM2 with overflow-safe A-side scaling):
-- v13 wrote raw `z.to(fp16)` for the SwiGLU output; SwiGLU values reach
-  O(1000s+) and a small fraction overflowed FP16's 65504 max → Inf →
-  INCORRECT_NUMERICAL on 13/19 workloads. v15 fixes this with per-row,
-  per-128-K-block A-side scaling (mirror of the existing B-side scale
-  layout), so every FP16 store is in [-32000, 32000] (2× headroom).
-  * `_swiglu_to_fp16_scaled`: per (BLOCK_M tokens × 128 K-elems) tile,
-    compute row_max → scale = max/32000 → store z/scale as FP16 plus the
-    scale into `swiglu_scale_a [I//128, gcap]` FP32.
-  * `_grouped_gemm2`: A loaded as FP16; B loaded as FP8 then `b.to(fp16)`
-    directly (LOSSLESS — FP8 max 448 fits in FP16; 3-bit mantissa fits
-    in 10-bit FP16). Both A-side scale (per-row, per-K-block) and B-side
-    scale (per-128-N × per-128-K) factored OUT of the dot and applied
-    to the FP32 accumulator: `acc += partial * sa[:, None] * sb`.
+v16 (this version):
+- Step 9 was 4 ops (mul + zeros + index_add_ + copy_) costing ~343µs for
+  T=2048, dominated by index_add_: a scatter with random writes that breaks
+  memory coalescing and requires atomics for duplicate token IDs.
+- `_scatter_sorted_tokens` now also fills `token_slot_map[T, TOP_K]`: for
+  each top-k assignment that lands on a local expert, stores the workspace
+  slot index. Non-local entries retain the gcap sentinel.
+- New `_weighted_output` kernel: grid=(T, H//128), one CTA per (token, column
+  block). Iterates k=0..7, reads gemm2_out[slot, :] and sorted_weights[slot],
+  accumulates in float32, writes bfloat16 directly to output. No intermediates,
+  no atomics, coalesced writes. Estimated memory traffic: 557MB → 87MB.
 
 Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — Triton; [T,8] indices + weights
   2. _count_expert_tokens    — Triton; expert token counts
   3. GPU cumsum (no CPU sync) — expert_offsets [E_LOCAL+1]
-  4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights
+  4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
+                               token_slot_map
   5. _grouped_gemm1_swiglu   — FP8×FP8→float32 (FP8 tensor cores)
   6. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
   7. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
-  8. weighted scatter        — index_add_ into out_f32
-  9. output.copy_(out_f32)   — float32 → bfloat16
+  8. _weighted_output        — gather gemm2_out via slot_map → bf16 output
 """
 
 import torch
@@ -78,6 +70,9 @@ def _ensure_workspace(T: int, device):
         'write_ptrs':       torch.empty(E_LOCAL,       dtype=torch.int32,   device=device),
         'sorted_token_ids': torch.zeros(gcap,          dtype=torch.int32,   device=device),
         'sorted_weights':   torch.zeros(gcap,          dtype=torch.float32, device=device),
+        # token_slot_map[t, k] = workspace slot for token t's k-th top-k expert,
+        # or gcap (sentinel) if that assignment is not a local expert.
+        'token_slot_map':   torch.full((T, TOP_K), gcap, dtype=torch.int32, device=device),
         'gemm1_out':        torch.zeros((gcap, 2 * I), dtype=torch.float32, device=device),
         'swiglu_fp16':      torch.empty((gcap, I),     dtype=torch.float16, device=device),
         'swiglu_scale_a':   torch.empty((I // QUANT_BLOCK, gcap), dtype=torch.float32, device=device),
@@ -434,9 +429,13 @@ def _scatter_sorted_tokens(
     write_ptrs_ptr,        # [E_LOCAL] int32 — per-expert write cursor (clone of offsets[:-1])
     sorted_token_ids_ptr,  # [total_tokens] int32 (output)
     sorted_weights_ptr,    # [total_tokens] f32   (output)
+    slot_map_ptr,          # [T, TOP_K] int32 (output) — workspace slot per (token, top_k_k)
     local_start, T,
 ):
-    """One CTA per token. Scatter each token into its expert's sorted slice."""
+    """One CTA per token. Scatter each token into its expert's sorted slice.
+    Also fills slot_map[pid, k] = workspace slot for local assignments so the
+    output gather kernel can find each token's contributions without index_add_.
+    """
     pid = tl.program_id(0)
     if pid >= T:
         return
@@ -452,6 +451,46 @@ def _scatter_sorted_tokens(
         pos = tl.atomic_add(write_ptrs_ptr + lid_safe, 1, mask=is_local)
         tl.store(sorted_token_ids_ptr + pos, pid, mask=is_local)
         tl.store(sorted_weights_ptr   + pos, w,   mask=is_local)
+        # Record which workspace slot this (token, top_k_k) maps to.
+        # Non-local k entries retain the gcap sentinel written during workspace init.
+        tl.store(slot_map_ptr + pid * 8 + k, pos, mask=is_local)
+
+
+@triton.jit
+def _weighted_output(
+    gemm2_out_ptr,       # [gcap, H] f32  — GEMM2 output
+    sorted_weights_ptr,  # [gcap] f32     — per-slot routing weight
+    slot_map_ptr,        # [T, TOP_K] int32 — workspace slot per (token, k); gcap = sentinel
+    out_ptr,             # [T, H] bf16    — final output (written directly)
+    T, H, gcap,
+    BLOCK_N: tl.constexpr,
+):
+    """Token-parallel gather: one CTA per (output token, column block).
+
+    For each output token, reads up to TOP_K=8 rows from gemm2_out (identified
+    via slot_map), multiplies each by its routing weight, accumulates in float32,
+    then stores as bfloat16. Writes are coalesced (consecutive threads write
+    consecutive columns of the same token row). No atomics needed.
+    """
+    pid_t = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rn     = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = rn < H
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for k in tl.static_range(8):          # TOP_K = 8
+        slot     = tl.load(slot_map_ptr + pid_t * 8 + k)
+        is_valid = slot < gcap             # gcap is sentinel for "not a local expert"
+        slot_s   = tl.where(is_valid, slot, 0)
+
+        w   = tl.load(sorted_weights_ptr + slot_s, mask=is_valid, other=0.0)
+        row = tl.load(gemm2_out_ptr + slot_s * H + rn,
+                      mask=is_valid & mask_n, other=0.0)
+        acc = acc + row * w
+
+    tl.store(out_ptr + pid_t * H + rn, acc.to(tl.bfloat16), mask=mask_n)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,7 +522,8 @@ def kernel(
     # ── Re-init mutable buffers (all GPU ops, near-zero latency) ─────────────
     ws['expert_counts'].zero_()
     ws['expert_offsets'].zero_()
-    ws['sorted_weights'].zero_()   # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
+    ws['sorted_weights'].zero_()        # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
+    ws['token_slot_map'].fill_(gcap)    # reset sentinel; scatter will overwrite local assignments
 
     # ── 1. Fused routing (Triton, 1 kernel) ──────────────────────────────────
     _routing_kernel[(T,)](
@@ -505,6 +545,7 @@ def kernel(
     _scatter_sorted_tokens[(T,)](
         ws['topk_idx'], ws['topk_weights'], ws['write_ptrs'],
         ws['sorted_token_ids'], ws['sorted_weights'],
+        ws['token_slot_map'],
         local_start, T,
     )
 
@@ -544,7 +585,7 @@ def kernel(
         I=I, BLOCK_M=32, BLOCK_I=128,
     )
 
-    # ── 8. Grouped GEMM2 → [gcap, H] ─────────────────────────────────────────
+    # ── 7. Grouped GEMM2 → [gcap, H] ─────────────────────────────────────────
     grid2 = lambda meta: (
         triton.cdiv(gcap, meta['BLOCK_M']) + E_LOCAL,
         triton.cdiv(H, meta['BLOCK_N']),
@@ -562,9 +603,11 @@ def kernel(
         ws['gemm2_out'].stride(0),      ws['gemm2_out'].stride(1),
     )
 
-    # ── 9. Weighted scatter + cast ────────────────────────────────────────────
-    # invalid workspace rows: sorted_weights = 0 → weighted = 0 → no output contribution
-    weighted = ws['gemm2_out'] * ws['sorted_weights'].unsqueeze(1)
-    out_f32  = torch.zeros((T, H), dtype=torch.float32, device=device)
-    out_f32.index_add_(0, ws['sorted_token_ids'].long(), weighted)
-    output.copy_(out_f32)
+    # ── 8. Token-parallel gather → bfloat16 output ───────────────────────────
+    # Each CTA handles one (output token, column block). Reads up to 8 gemm2_out
+    # rows via token_slot_map, multiplies by sorted_weights, writes bf16 directly.
+    # No intermediates, no atomics, coalesced writes. ~557MB → ~87MB traffic.
+    _weighted_output[(T, triton.cdiv(H, 128))](
+        ws['gemm2_out'], ws['sorted_weights'], ws['token_slot_map'],
+        output, T, H, gcap, BLOCK_N=128,
+    )
