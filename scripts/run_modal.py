@@ -1,8 +1,9 @@
 """
-FlashInfer-Bench Modal Cloud Benchmark Runner.
+Run your Triton/CUDA kernel on Modal B200 and get speedup vs FlashInfer baseline.
 
-Automatically packs the solution from source files and runs benchmarks
-on NVIDIA B200 GPUs via Modal.
+All flashinfer_bench work happens inside the Modal container (Linux). The local
+side only reads source files and the per-track config.toml — no flashinfer_bench
+import on macOS.
 
 Setup (one-time):
     modal setup
@@ -10,18 +11,12 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 
 Usage:
-    modal run scripts/run_modal.py [OPTIONS]
+    modal run scripts/run_modal.py --track moe [OPTIONS]
 
 Options:
     --track TEXT                 [required] Track subdirectory (containing
                                  config.toml). One of:
                                  dsa_indexer | dsa_attention | moe.
-
-    --use-official-baseline /    Load the upstream flashinfer+deep_gemm
-    --no-use-official-baseline   baseline JSON instead of packing from source
-                                 (sanity check; only meaningful for
-                                 dsa_indexer).
-                                 Default: --no-use-official-baseline
 
     --debug / --no-debug         Sets FIB_DEBUG=1/0 in the container. Kernels
                                  that support it (e.g. dsa_indexer) re-run the
@@ -39,15 +34,20 @@ Options:
 
 """
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
@@ -55,194 +55,228 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git")
-    .pip_install(
-        "torch", "triton", "numpy",
-        # cupti-python: flashinfer-bench uses CUPTI for ~10ns precision kernel
-        # timing (falls back to CUDA events if missing). Safe to keep — we're
-        # not running any external CUPTI subscribers (NCU/nsys) anymore.
-        "cupti-python",
-        # Required by the dsa_attention track's kernel_cute_v2.py (imports
-        # `cutlass.cute` for CuTe-DSL kernels). Harmless if unused by
-        # dsa_indexer / moe tracks.
-        "nvidia-cutlass-dsl",
-        # Required ONLY when running --use-official-baseline (the dsa_indexer
-        # baseline solution `flashinfer_deepgemm_wrapper_*.json` calls these at
-        # runtime). Submission code must NOT import these — see FAQ.md L166-170.
-        "flashinfer-python",
+    modal.Image.from_registry(
+        "flashinfer/flashinfer-ci-cu132:20260401-2c675fb",
+        add_python="3.12",
     )
-    # IMPORTANT: install flashinfer-bench FROM SOURCE. The PyPI release is
-    # older than 2026-04-10 and lacks the DsaTopkIndexerEvaluator (PR #354)
-    # that handles NaN-ordering differences via sorted-score comparison.
-    # FAQ.md recommends installing from source for latest eval changes.
+    .pip_install(
+        # cupti-python: flashinfer-bench uses CUPTI for ~10ns precision kernel
+        # timing (falls back to CUDA events if missing).
+        "cupti-python",
+        # Required for any CuTe-DSL kernel (e.g. moe GEMM2 rewrite).
+        "nvidia-cutlass-dsl",
+    )
+    # Install flashinfer-bench FROM SOURCE — PyPI release lags main and lacks
+    # evaluator fixes (e.g. DsaTopkIndexerEvaluator NaN-ordering, PR #354).
     .run_commands(
         "git clone https://github.com/flashinfer-ai/flashinfer-bench.git /opt/flashinfer-bench",
         "cd /opt/flashinfer-bench && pip install -v -e .",
-        # deep_gemm is not on PyPI; install from DeepSeek's GitHub. Only needed
-        # for --use-official-baseline (same FAQ caveat as flashinfer above).
-        # Disabled: upstream metadata-generation fails on Modal build. Re-enable
-        # (and pin a known-good commit) when running --use-official-baseline.
-        # "pip install git+https://github.com/deepseek-ai/DeepGEMM.git",
     )
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(
-    solution: Solution,
-    config: BenchmarkConfig = None,
+def pack_and_run(
+    sources: dict,
+    config: dict,
     max_workloads: int = None,
     debug: bool = False,
     profile: bool = False,
 ) -> dict:
-    """Run benchmark on Modal B200 and return results.
+    """Run entirely on the Modal Linux container.
 
-    If `max_workloads` is set, only the first N workloads are run (handy for
-    iterating on correctness / debugging before a full sweep).
+    1. Writes source files to a temp directory.
+    2. Packs them into a Solution via flashinfer_bench.
+    3. Benchmarks against all workloads and returns a result dict.
 
     Generic env flags read by any track's kernel:
       FIB_DEBUG=1    → kernel may re-run the reference and print a diff
       FIB_PROFILE=1  → kernel may print per-stage CUDA-event timings
     """
     import os
+    import tempfile
+
+    from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
+    from flashinfer_bench.agents import pack_solution_from_files
+
     os.environ["FIB_DEBUG"] = "1" if debug else "0"
     os.environ["FIB_PROFILE"] = "1" if profile else "0"
 
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    sol_cfg = config["solution"]
+    build_cfg = config["build"]
+
+    language = build_cfg["language"]
+    entry_point = build_cfg["entry_point"]
+    dps = build_cfg.get("destination_passing_style", True)
+    definition = sol_cfg["definition"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for filename, content in sources.items():
+            dest = os.path.join(tmpdir, filename)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as f:
+                f.write(content)
+
+        spec = BuildSpec(
+            language=language,
+            target_hardware=["cuda"],
+            entry_point=entry_point,
+            destination_passing_style=dps,
+        )
+        solution = pack_solution_from_files(
+            path=tmpdir,
+            spec=spec,
+            name=sol_cfg["name"],
+            definition=definition,
+            author=sol_cfg["author"],
+        )
+
+    print(f"Packed: {solution.name}  (lang={language}, dps={dps})")
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    if definition not in trace_set.definitions:
+        raise ValueError(f"Definition '{definition}' not found in trace set")
 
-    if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
-
-    definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
-
+    workloads = trace_set.workloads.get(definition, [])
     if not workloads:
-        raise ValueError(f"No workloads found for definition '{solution.definition}'")
+        raise ValueError(f"No workloads found for '{definition}' in {TRACE_SET_PATH}")
 
-    if max_workloads is not None:
+    if max_workloads is not None and max_workloads > 0:
         workloads = workloads[:max_workloads]
         print(f"DEBUG MODE: running only the first {len(workloads)} workloads")
 
-    bench_trace_set = TraceSet(
+    bench_ts = TraceSet(
         root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
+        definitions={definition: trace_set.definitions[definition]},
+        solutions={definition: [solution]},
+        workloads={definition: workloads},
+        traces={definition: []},
     )
 
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    bench_cfg = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    result_ts = Benchmark(bench_ts, bench_cfg).run_all(dump_traces=True)
 
-    traces = result_trace_set.traces.get(definition.name, [])
-    results = {definition.name: {}}
-
-    for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-                "log": trace.evaluation.log,  # full stdout/stderr incl. compile errors
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            results[definition.name][trace.workload.uuid] = entry
+    results = {}
+    for trace in result_ts.traces.get(definition, []):
+        if not trace.evaluation:
+            continue
+        entry = {
+            "status": trace.evaluation.status.value,
+            "log": trace.evaluation.log,
+        }
+        if trace.evaluation.performance:
+            p = trace.evaluation.performance
+            entry["latency_ms"] = p.latency_ms
+            entry["reference_latency_ms"] = p.reference_latency_ms
+            entry["speedup_factor"] = p.speedup_factor
+        if trace.evaluation.correctness:
+            c = trace.evaluation.correctness
+            entry["max_abs_error"] = c.max_absolute_error
+            entry["max_rel_error"] = c.max_relative_error
+        results[str(trace.workload.uuid)] = entry
 
     return results
 
 
+def _load_track_sources(track: str) -> tuple[dict, dict]:
+    """Read <track>/config.toml and gather source files. Local-only, no flashinfer-bench."""
+    track_dir = PROJECT_ROOT / track
+    config_path = track_dir / "config.toml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Track config not found: {config_path}")
+
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
+
+    language = config["build"]["language"]
+    if language == "triton":
+        source_dir = track_dir / "solution" / "triton"
+    elif language == "cuda":
+        source_dir = track_dir / "solution" / "cuda"
+    elif language == "python":
+        source_dir = track_dir / "solution" / "python"
+    else:
+        raise ValueError(f"Unknown language: {language}")
+
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {source_dir}")
+
+    sources = {f.name: f.read_text() for f in source_dir.glob("*.py")}
+    if language == "cuda":
+        sources.update({f.name: f.read_text() for f in source_dir.glob("*.cu")})
+        sources.update({f.name: f.read_text() for f in source_dir.glob("*.cuh")})
+
+    if not sources:
+        raise FileNotFoundError(f"No source files found in {source_dir}")
+
+    return sources, config
+
+
 def print_results(results: dict):
-    """Print benchmark results in a formatted way."""
-    failure_logs_printed = False
-    for def_name, traces in results.items():
-        print(f"\n{def_name}:")
-        for workload_uuid, result in traces.items():
-            status = result.get("status")
-            print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
+    """Format and print the results dict returned from pack_and_run."""
+    print(f"\n{'Workload':<12} {'Status':<14} {'Latency (ms)':<16} {'Speedup':<12} {'abs_err'}")
+    print("-" * 72)
 
-            if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+    latencies, speedups = [], []
+    for uuid, r in sorted(results.items()):
+        status = r.get("status", "?")
+        lat = r.get("latency_ms")
+        speedup = r.get("speedup_factor")
+        abs_err = r.get("max_abs_error")
 
-            if result.get("speedup_factor") is not None:
-                print(f" | {result['speedup_factor']:.2f}x speedup", end="")
+        lat_str = f"{lat:.4f}" if lat is not None else "N/A"
+        speedup_str = f"{speedup:.3f}x" if speedup is not None else "N/A"
+        err_str = f"{abs_err:.2e}" if abs_err is not None else "N/A"
 
-            if result.get("max_abs_error") is not None:
-                abs_err = result["max_abs_error"]
-                rel_err = result.get("max_rel_error", 0)
-                print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
+        print(f"{uuid[:8]:<12} {status:<14} {lat_str:<16} {speedup_str:<12} {err_str}")
 
-            print()
+        if lat is not None:
+            latencies.append(lat)
+        if speedup is not None:
+            speedups.append(speedup)
 
-        # If any workload failed, dump the log of the WORST failure (largest
-        # abs_err) so we see the most revealing bug, not just the first mild one.
-        if not failure_logs_printed:
-            worst = None
-            worst_err = -1.0
-            for workload_uuid, result in traces.items():
-                if result.get("status") != "PASSED" and result.get("log"):
-                    err = result.get("max_abs_error") or 0
-                    if err > worst_err:
-                        worst_err = err
-                        worst = (workload_uuid, result)
-            if worst is not None:
-                workload_uuid, result = worst
-                print("\n" + "=" * 70)
-                print(f"Worst failure log ({workload_uuid[:8]}..., "
-                      f"{result.get('status')}, abs_err={worst_err:.2e}):")
-                print("=" * 70)
-                print(result["log"])
-                print("=" * 70)
-                failure_logs_printed = True
+    if latencies:
+        import statistics
+        print(f"\nSummary ({len(latencies)} workloads):")
+        print(f"  Latency — min: {min(latencies):.4f} ms  max: {max(latencies):.4f} ms  median: {statistics.median(latencies):.4f} ms")
+    if speedups:
+        import statistics
+        print(f"  Speedup — min: {min(speedups):.3f}x  max: {max(speedups):.3f}x  mean: {statistics.mean(speedups):.3f}x")
+
+    worst = None
+    worst_err = -1.0
+    for uuid, r in results.items():
+        if r.get("status") != "PASSED" and r.get("log"):
+            err = r.get("max_abs_error") or 0
+            if err > worst_err:
+                worst_err = err
+                worst = (uuid, r)
+    if worst is not None:
+        uuid, r = worst
+        print("\n" + "=" * 70)
+        print(f"Worst failure log ({uuid[:8]}..., {r.get('status')}, abs_err={worst_err:.2e}):")
+        print("=" * 70)
+        print(r["log"])
+        print("=" * 70)
 
 
 @app.local_entrypoint()
 def main(
     track: str,
-    use_official_baseline: bool = False,
     debug: bool = False,
     profile: bool = False,
     max_workloads: int = 0,
 ):
-    """Pack the solution for one track and run benchmark on Modal.
+    """Pack the solution for one track and run benchmark on Modal."""
+    print(f"Loading sources for track '{track}'...")
+    sources, config = _load_track_sources(track)
+    print(f"Sending {len(sources)} file(s) to Modal: {list(sources.keys())}")
+    print("Running on Modal B200...")
 
-    See the module-level docstring for the full option/example reference.
-    """
-    if use_official_baseline:
-        baseline_path = (
-            PROJECT_ROOT
-            / "mlsys26-contest"
-            / "solutions"
-            / "baseline"
-            / "dsa"
-            / "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-            / "flashinfer_deepgemm_wrapper_2ba145.json"
-        )
-        print(f"SANITY MODE: loading official baseline from {baseline_path}")
-        solution = Solution.model_validate_json(baseline_path.read_text())
-    else:
-        from scripts.pack_solution import pack_solution
-        print(f"Packing solution for track '{track}'...")
-        solution_path = pack_solution(track)
-        print("\nLoading solution...")
-        solution = Solution.model_validate_json(solution_path.read_text())
-
-    print(f"Loaded: {solution.name} ({solution.definition})")
-
-    print("\nRunning benchmark on Modal B200...")
-    # Small subset while --profile is on — profile output would flood stdout
-    # otherwise. Pass --max-workloads 0 for the full sweep.
     workload_limit = max_workloads if max_workloads and max_workloads > 0 else None
-    results = run_benchmark.remote(
-        solution,
+    results = pack_and_run.remote(
+        sources,
+        config,
         max_workloads=workload_limit,
         debug=debug,
         profile=profile,
