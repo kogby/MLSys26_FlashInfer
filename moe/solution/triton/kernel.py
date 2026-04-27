@@ -1,14 +1,31 @@
 """
-Triton FP8 Fused MoE kernel — v12
+Triton FP8 Fused MoE kernel — v15
 
-v12 vs v11:
-- Zero CPU syncs: pre-allocate all workspace buffers keyed by (T, device).
-  sorted_weights zeroed each call → invalid entries contribute 0 to output.
-  Fixed GEMM grids use gcap=2*T instead of token_counts_cpu (no CPU sync).
-  Early-exit guard in GEMM kernels handles over-launched CTAs gracefully.
+v15 merges two independent optimizations:
+
+v12 (zero CPU syncs, Ethan):
+- Pre-allocate all workspace buffers keyed by (T, device); sorted_weights
+  zeroed each call → invalid entries contribute 0 to output.
+- Fixed GEMM grids use gcap=2*T instead of token_counts_cpu (no CPU sync).
+- Early-exit guard in GEMM kernels handles over-launched CTAs gracefully.
 - Per-call allocations: 7 → 3 zero_() GPU ops (near-zero cost).
 - GPU idle gap eliminated: routing → count → cumsum → scatter → GEMM1
   flows without CPU blocking.
+
+v14/v15 (FP16 GEMM2 with overflow-safe A-side scaling):
+- v13 wrote raw `z.to(fp16)` for the SwiGLU output; SwiGLU values reach
+  O(1000s+) and a small fraction overflowed FP16's 65504 max → Inf →
+  INCORRECT_NUMERICAL on 13/19 workloads. v15 fixes this with per-row,
+  per-128-K-block A-side scaling (mirror of the existing B-side scale
+  layout), so every FP16 store is in [-32000, 32000] (2× headroom).
+  * `_swiglu_to_fp16_scaled`: per (BLOCK_M tokens × 128 K-elems) tile,
+    compute row_max → scale = max/32000 → store z/scale as FP16 plus the
+    scale into `swiglu_scale_a [I//128, gcap]` FP32.
+  * `_grouped_gemm2`: A loaded as FP16; B loaded as FP8 then `b.to(fp16)`
+    directly (LOSSLESS — FP8 max 448 fits in FP16; 3-bit mantissa fits
+    in 10-bit FP16). Both A-side scale (per-row, per-K-block) and B-side
+    scale (per-128-N × per-128-K) factored OUT of the dot and applied
+    to the FP32 accumulator: `acc += partial * sa[:, None] * sb`.
 
 Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — Triton; [T,8] indices + weights
@@ -16,9 +33,9 @@ Pipeline (all GPU, no CPU sync):
   3. GPU cumsum (no CPU sync) — expert_offsets [E_LOCAL+1]
   4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights
   5. _grouped_gemm1_swiglu   — FP8×FP8→float32 (FP8 tensor cores)
-  6. _swiglu_inplace         — silu(up)*gate
-  7. _grouped_gemm2          — float32×FP8→float32
-  8. weighted scatter         — index_add_ into out_f32
+  6. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
+  7. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
+  8. weighted scatter        — index_add_ into out_f32
   9. output.copy_(out_f32)   — float32 → bfloat16
 """
 
@@ -62,6 +79,8 @@ def _ensure_workspace(T: int, device):
         'sorted_token_ids': torch.zeros(gcap,          dtype=torch.int32,   device=device),
         'sorted_weights':   torch.zeros(gcap,          dtype=torch.float32, device=device),
         'gemm1_out':        torch.zeros((gcap, 2 * I), dtype=torch.float32, device=device),
+        'swiglu_fp16':      torch.empty((gcap, I),     dtype=torch.float16, device=device),
+        'swiglu_scale_a':   torch.empty((I // QUANT_BLOCK, gcap), dtype=torch.float32, device=device),
         'gemm2_out':        torch.zeros((gcap, H),     dtype=torch.float32, device=device),
         'gcap':             gcap,
     }
@@ -175,41 +194,70 @@ def _grouped_gemm1_swiglu(
 
 
 @triton.jit
-def _swiglu_inplace(
-    X_ptr,
+def _swiglu_to_fp16_scaled(
+    X_ptr,           # [total_tokens, 2*I] FP32  (gemm1_out, read-only)
+    Y_ptr,           # [total_tokens, I]   FP16  (output, per-row × per-128 scaled)
+    SA_ptr,          # [I//BLOCK_I, total_tokens] FP32  (per-row × per-128 scale)
     total_tokens,
+    stride_sA_kb,    # = total_tokens (rows are K-blocks)
+    stride_sA_m,     # = 1            (cols are token-rows)
     I: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
+    """SwiGLU + per-row, per-128-K-block FP16 quantization.
+
+    For each (BLOCK_M tokens × BLOCK_I=128 contiguous K-elems) tile:
+      z       = sigmoid(up) * up * gate       (FP32)
+      row_max = max(|z|, axis=1)              (FP32, [BLOCK_M])
+      scale   = max(row_max, eps) / 32000     (target |z_fp16| ≤ 32000)
+      store   z / scale[:, None]   as FP16
+      store   scale                 to SA[pid_i, rm]
+
+    Aligning the scale to BLOCK_K=128 along the K dimension keeps the scale
+    constant across each reduction step inside `_grouped_gemm2`, so it can be
+    factored outside `tl.dot` and applied to the FP32 accumulator without
+    losing FP16 tensor-core throughput.
+    """
     pid_m = tl.program_id(0)
     pid_i = tl.program_id(1)
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     ri = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_m = rm < total_tokens
+    mask_i = ri < I
+    mask   = mask_m[:, None] & mask_i[None, :]
 
     gate = tl.load(X_ptr + rm[:, None] * (2 * I) + ri[None, :],
-                   mask=(rm[:, None] < total_tokens) & (ri[None, :] < I), other=0.0)
+                   mask=mask, other=0.0)
     up   = tl.load(X_ptr + rm[:, None] * (2 * I) + (ri[None, :] + I),
-                   mask=(rm[:, None] < total_tokens) & (ri[None, :] < I), other=0.0)
+                   mask=mask, other=0.0)
 
-    z = tl.sigmoid(up) * up * gate
+    z = tl.sigmoid(up) * up * gate                  # [BLOCK_M, BLOCK_I] FP32
 
-    tl.store(X_ptr + rm[:, None] * (2 * I) + ri[None, :],
-             z,
-             mask=(rm[:, None] < total_tokens) & (ri[None, :] < I))
+    # Per-row, per-128-K-block dynamic scale. 32000 leaves 2× headroom from
+    # FP16 max=65504, so any rounding/cast bumps still stay finite.
+    row_max = tl.max(tl.abs(z), axis=1)             # [BLOCK_M]
+    scale   = tl.maximum(row_max, 1e-30) / 32000.0  # [BLOCK_M]
+
+    z_fp16 = (z / scale[:, None]).to(tl.float16)    # values in [-32000, 32000]
+
+    tl.store(Y_ptr + rm[:, None] * I + ri[None, :], z_fp16, mask=mask)
+    tl.store(SA_ptr + pid_i * stride_sA_kb + rm * stride_sA_m,
+             scale, mask=mask_m)
 
 
 @triton.autotune(configs=_GEMM_CONFIGS, key=['N', 'K', 'total_tokens'])
 @triton.jit
 def _grouped_gemm2(
-    A_ptr,
-    B_ptr, SB_ptr,
-    C_ptr,
+    A_ptr, SA_ptr,            # A: [total_tokens, K] FP16 ; SA: [K//128, total_tokens] FP32
+    B_ptr, SB_ptr,            # B: FP8 weights, SB: per-128-block scales
+    C_ptr,                    # [total_tokens, N] FP32  (output)
     expert_offsets_ptr,
     N, K,
     total_tokens,
     stride_am, stride_ak,
+    stride_sA_kb, stride_sA_m,
     stride_be, stride_bn, stride_bk,
     stride_sB_e, stride_sB_nb, stride_sB_kb,
     stride_cm, stride_cn,
@@ -249,19 +297,29 @@ def _grouped_gemm2(
     for kb in range(K // BLOCK_K):
         rk = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
+        # A is FP16 (per-row × per-128-K-block scaled SwiGLU output).
         a = tl.load(
             A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak,
             mask=(rm_local[:, None] < M_e) & (rk[None, :] < K), other=0.0,
-        ).to(tl.float32)
+        )
+        sa = tl.load(
+            SA_ptr + kb * stride_sA_kb + rm * stride_sA_m,
+            mask=rm_local < M_e, other=0.0,
+        )
 
+        # B is FP8 → FP16 directly (lossless: FP8 max=448 fits, 3-bit
+        # mantissa fits in 10-bit FP16). Per-128 SB factored outside dot.
         b = tl.load(
             B_ptr + pid_e * stride_be + rn[:, None] * stride_bn + rk[None, :] * stride_bk,
             mask=(rn[:, None] < N) & (rk[None, :] < K), other=0.0,
         )
-        sb = tl.load(SB_ptr + pid_e * stride_sB_e + pid_n * stride_sB_nb + kb * stride_sB_kb)
-        b  = b.to(tl.float32) * sb
+        sb     = tl.load(SB_ptr + pid_e * stride_sB_e + pid_n * stride_sB_nb + kb * stride_sB_kb)
+        b_fp16 = b.to(tl.float16)
 
-        acc = tl.dot(a, tl.trans(b), acc, out_dtype=tl.float32)
+        # FP16 × FP16 → FP32 tensor core (HMMA on Hopper, similar on Blackwell).
+        # Both block scales are constant across the reduction → applied to acc.
+        partial = tl.dot(a, tl.trans(b_fp16), out_dtype=tl.float32)
+        acc = acc + partial * sa[:, None] * sb
 
     tl.store(
         C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
@@ -476,10 +534,15 @@ def kernel(
         ws['gemm1_out'].stride(0), ws['gemm1_out'].stride(1),
     )
 
-    # ── 7. SwiGLU in-place ────────────────────────────────────────────────────
-    _swiglu_inplace[
+    # ── 7. SwiGLU + per-row × per-128-K-block FP16 quantization ──────────────
+    _swiglu_to_fp16_scaled[
         (triton.cdiv(gcap, 32), triton.cdiv(I, 128))
-    ](ws['gemm1_out'], gcap, I=I, BLOCK_M=32, BLOCK_I=128)
+    ](
+        ws['gemm1_out'], ws['swiglu_fp16'], ws['swiglu_scale_a'],
+        gcap,
+        ws['swiglu_scale_a'].stride(0), ws['swiglu_scale_a'].stride(1),
+        I=I, BLOCK_M=32, BLOCK_I=128,
+    )
 
     # ── 8. Grouped GEMM2 → [gcap, H] ─────────────────────────────────────────
     grid2 = lambda meta: (
@@ -487,15 +550,16 @@ def kernel(
         triton.cdiv(H, meta['BLOCK_N']),
     )
     _grouped_gemm2[grid2](
-        ws['gemm1_out'],
-        gemm2_weights, gemm2_weights_scale,
+        ws['swiglu_fp16'],              ws['swiglu_scale_a'],
+        gemm2_weights,                  gemm2_weights_scale,
         ws['gemm2_out'],
         ws['expert_offsets'],
         H, I, gcap,
-        ws['gemm1_out'].stride(0), ws['gemm1_out'].stride(1),
-        gemm2_weights.stride(0),  gemm2_weights.stride(1), gemm2_weights.stride(2),
-        gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
-        ws['gemm2_out'].stride(0), ws['gemm2_out'].stride(1),
+        ws['swiglu_fp16'].stride(0),    ws['swiglu_fp16'].stride(1),
+        ws['swiglu_scale_a'].stride(0), ws['swiglu_scale_a'].stride(1),
+        gemm2_weights.stride(0),        gemm2_weights.stride(1), gemm2_weights.stride(2),
+        gemm2_weights_scale.stride(0),  gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
+        ws['gemm2_out'].stride(0),      ws['gemm2_out'].stride(1),
     )
 
     # ── 9. Weighted scatter + cast ────────────────────────────────────────────

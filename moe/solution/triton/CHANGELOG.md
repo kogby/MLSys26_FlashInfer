@@ -1,5 +1,68 @@
 # Triton Kernel Changelog
 
+## v15 — Per-row × per-128-K-block A-side scaling for FP16 GEMM2 (current)
+
+**Why:** v14 wrote raw `z.to(fp16)` for the SwiGLU output and routed GEMM2 through FP16 tensor cores. SwiGLU values reach O(1000s+) on a small fraction of (token, K-block) tiles, and those overflow FP16's 65504 max → Inf → INCORRECT_NUMERICAL on **13 / 19** workloads on the bench. Per-row × per-128-K-block scaling on the A side fixes the overflow without touching the FP16 tensor-core fast path.
+
+**Why this scale layout:**
+- Aligning the A-side scale block to `BLOCK_K=128` along the reduction dimension means the scale is constant across each `tl.dot` step. We can factor it out of the dot and apply it to the FP32 accumulator (`acc += partial * sa[:, None] * sb`) — same trick that v10 uses on the B side.
+- Per-row (not per-tile) on the M dimension matches how SwiGLU outputs vary: one token's K-block 7 may have `|z| ≈ 50000` while another row in the same tile has `|z| ≈ 0.1`. A per-row scale gives each row its own dynamic range and uses FP16's full 10-bit mantissa per element.
+- Layout `[I//128, total_tokens]` mirrors the existing `hidden_states_scale` layout used by GEMM1, so strides and access patterns are familiar.
+- Total scale-tensor footprint: `16 × total_tokens × 4 B` ≈ 2 MB at `T = 32k` — negligible.
+
+**What changed (two kernel signatures + a buffer in `kernel()`):**
+- `_swiglu_to_fp16` → `_swiglu_to_fp16_scaled`: per `(BLOCK_M tokens × BLOCK_I=128 K-elems)` tile, compute `row_max = max(|z|, axis=1)`, derive `scale = max(row_max, 1e-30) / 32000` (2× headroom from FP16 max=65504), store `(z / scale[:, None]).to(fp16)` and write the scale into `swiglu_scale_a[pid_i, rm]`.
+- `_grouped_gemm2`: A loaded as FP16 (unchanged from v13). B loaded as FP8 then `b.to(fp16)` **directly** (lossless: FP8 max=448 fits in FP16, 3-bit FP8 mantissa fits in 10-bit FP16). The FP8 → FP32 → FP16 cast from v13 is dropped — that intermediate FP32 multiply by `sb` was wasted because `sb` is K-block-constant and can also be factored out. New inner loop: `partial = tl.dot(a, tl.trans(b_fp16), out_dtype=fp32); acc = acc + partial * sa[:, None] * sb`. Both block scales applied to the FP32 accumulator outside the dot.
+- `kernel()`: allocates `swiglu_scale_a: [I//128, total_tokens]` FP32 alongside `swiglu_fp16` and passes it (with strides) to both kernels.
+
+**Expected wins:** correctness restored on the 13 workloads that v13 broke, with no slowdown vs v13 on the workloads it already passed. The B-side simplification (one less FP32 multiply per K-step) is a tiny extra plus.
+
+**Routing/count/scatter and GEMM1 are byte-identical to v11.**
+
+**Follow-ups (not in v14):**
+- Eliminate the routing CPU sync (GPU-side grid sizing + early-return guard in GEMMs), unlocking CUDA Graph capture.
+- Two-stream overlap of the dispatch path (revisit v12's idea on a non-default stream).
+
+---
+
+## v14 — FP16 GEMM2 input + FP16 tensor cores (BROKEN: 13/19 INCORRECT_NUMERICAL — superseded by v14)
+
+**Optimization:** Convert the GEMM2 A side (SwiGLU output) from float32 to FP16, routing the GEMM2 math through FP16 tensor cores instead of float32 SIMD.
+
+**Why FP16 (not BF16, not FP8):**
+- v10 tried BF16 for GEMM2 and failed correctness (~5–7% of elements outside the (atol=1, rtol=0.3) tolerance). The failure was **mantissa precision** — BF16's 7-bit mantissa accumulates ~1% relative error per K-step, and K=2048 in GEMM2 amplifies it past the threshold.
+- v6 tried FP8 for GEMM2 input and failed numerics on production workloads even with per-block scales (3-bit mantissa is too lossy after a K=2048 reduction).
+- **FP16 has 10 mantissa bits (≈8× tighter than BF16)** while still being a tensor-core-native format. Per-element relative error drops from ~1% (BF16) to ~0.1% (FP16), well inside the 30% rtol with room to spare.
+- Remaining risk is **range overflow** (FP16 max = 65504; SwiGLU outputs reach O(1000+)). v13 bet there was enough margin; the bet lost — addressed by v14's per-128-block A-side scaling.
+
+**What changed (two Triton kernels + a buffer in `kernel()`):**
+- `_swiglu_inplace` → `_swiglu_to_fp16`. Same compute path (`silu(up) * gate` in FP32) but writes a fresh `[total_tokens, I]` FP16 buffer instead of overwriting the first I cols of `gemm1_out`. The FP32 → FP16 cast happens once just before `tl.store`.
+- `_grouped_gemm2`: A is loaded as FP16 (no `.to(float32)` cast). B stays FP8 with per-128 scale, but is now narrowed to FP16 via `(b.to(float32) * sb).to(float16)` — lossless from FP8's 3-bit mantissa perspective. `tl.dot(a_fp16, tl.trans(b_fp16), acc, out_dtype=float32)` routes through FP16 tensor cores (HMMA on Hopper, similar on Blackwell). Accumulator stays FP32.
+- `kernel()`: allocates `swiglu_fp16: [total_tokens, I]` FP16 (~128 MB at T=32k, total_tokens≈32k) and passes it as A to `_grouped_gemm2`. The GEMM1 output buffer `gemm1_out` is still FP32 [total_tokens, 2*I] for SwiGLU input.
+
+**Expected wins (theoretical, before the overflow bug bit):**
+- **HBM bandwidth (A side)**: 4 → 2 bytes/elem. For large workloads GEMM2 reads ~256–512 MB of A; halving that is a real chunk of the per-call HBM budget.
+- **Compute**: B200/H100 FP16 tensor core throughput ≈ 2.2 PFLOP/s vs FP32 SIMD ≈ 0.55 PFLOP/s — ~4× speedup on GEMM2 math. GEMM2 is significant for large workloads (~30–40% of total per the v10 entry's reasoning), so even half the theoretical translates to ~5–8% on the mean.
+
+**Routing/count/scatter and GEMM1 are byte-identical to v11.**
+
+**What v14 carries over from v13:** the FP16 A buffer + FP16 tensor-core dot. Only the SwiGLU cast and B-side cast change to add scaling.
+
+---
+
+## v13 — Hoisted allocs + async D2H copy + upper-bound sorted buffers (REGRESSED — superseded back to v11)
+
+**Goal:** Hide the routing-stage CPU sync inside GPU compute by (a) hoisting the `out_f32` allocation to the top of `kernel()`, (b) using a pinned host buffer + `non_blocking=True` D2H copy with a `cuda.Event` for fine-grained sync, and (c) upper-bound–sized `sorted_token_ids` / `sorted_weights` so they don't depend on `total_tokens`.
+
+**Why it regressed (mean 19.176x vs v11's 20.598x):**
+- PyTorch defaults to **one CUDA stream**. Hoisting the `out_f32` allocation moved the work earlier in the same serial stream; it didn't actually overlap with anything on the GPU.
+- The pinned-host alloc + `cuda.Event()` machinery added per-call overhead that exceeded the ~0 µs of wall-clock savings.
+- Kept the worst-case slightly better but lost on the median; reverted to v11.
+
+**Lesson:** Real overlap requires a non-default stream (e.g. `torch.cuda.Stream()`) so the routing/dispatch queue is independent of the GEMM stream. Bookmarked as a v14 follow-up.
+
+**Bug along the way:** initial v12 hit XID 43 (illegal memory access) because `non_blocking=True` D2H does **not** implicitly sync when reading the destination tensor — total_tokens read garbage and OOB-gathered. Fix was an explicit `cuda.Event().synchronize()` between copy and read. Bug was correct after the fix; the perf loss is what motivated the revert.
+
 ## v12 — Zero CPU-sync via persistent workspace + fixed GEMM grids (current)
 
 **Optimization:** Eliminate the remaining CPU sync (`.cpu()` call between steps 3 and 4) by pre-allocating all output buffers once per unique batch size T.
