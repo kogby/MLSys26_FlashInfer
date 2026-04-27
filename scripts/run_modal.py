@@ -184,6 +184,10 @@ def pack_and_run(
             entry["max_rel_error"] = c.max_relative_error
         results[str(trace.workload.uuid)] = entry
 
+    # Print results inside the container too, so the speedup table is visible
+    # even when run with --detach (where local main() exits before remote returns).
+    print_results(results)
+
     return results
 
 
