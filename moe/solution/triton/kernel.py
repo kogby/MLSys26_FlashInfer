@@ -25,15 +25,14 @@ v16 (previous):
 - Token-parallel _weighted_output gather replaces index_add_ scatter.
 
 Pipeline (all GPU, no CPU sync):
-  1. _routing_kernel         — Triton; [T,8] indices + weights
-  2. _count_expert_tokens    — Triton; expert token counts
-  3. _prefix_sum             — Triton; expert_offsets [E_LOCAL+1] + write_ptrs
-  4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
+  1. _routing_kernel         — Triton; [T,8] indices + weights + fused counting
+  2. _prefix_sum             — Triton; expert_offsets [E_LOCAL+1] + write_ptrs
+  3. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
                                token_slot_map
-  5. _grouped_gemm1_swiglu   — FP8×FP8→float32 with inline token gather
-  6. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
-  7. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
-  8. _weighted_output        — gather gemm2_out via slot_map → bf16 output
+  4. _grouped_gemm1_swiglu   — FP8×FP8→float32 with inline token gather
+  5. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
+  6. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
+  7. _weighted_output        — gather gemm2_out via slot_map → bf16 output
 """
 
 import torch
@@ -349,9 +348,22 @@ def _routing_kernel(
     bias_ptr,             # [256] f32
     topk_idx_ptr,         # [T, 8] int32   (output)
     topk_weights_ptr,     # [T, 8] f32     (output)
-    T, routed_scaling_factor,
+    expert_counts_ptr,    # [E_LOCAL] int32 (output, zeroed before call; fused counting)
+    T, local_start, routed_scaling_factor,
 ):
-    """One CTA per token. Fuses sigmoid+bias, group scoring, top-K selection."""
+    """One CTA per token. Fuses sigmoid+bias, group scoring, top-K selection,
+    and expert token counting into a single kernel.
+
+    Merges the former `_count_expert_tokens` pass: after selecting the top-8
+    experts, `topk_idx_arr` is still live in registers, so we atomic-add each
+    local expert's slot directly — no global-memory round-trip needed.
+
+    The global barrier between counting and prefix-sum still exists as an
+    inter-kernel sync (prefix_sum waits for all T CTAs of this kernel), and the
+    barrier between prefix-sum and scatter is likewise unavoidable: these
+    require grid-wide synchronisation (CUDA cooperative kernels) that Triton
+    does not expose. Only the routing→counting barrier is eliminated here.
+    """
     pid = tl.program_id(0)
     if pid >= T:
         return
@@ -419,20 +431,10 @@ def _routing_kernel(
     tl.store(topk_idx_ptr     + pid * 8 + k_ids, topk_idx_arr)
     tl.store(topk_weights_ptr + pid * 8 + k_ids, topk_w_arr)
 
-
-@triton.jit
-def _count_expert_tokens(
-    topk_idx_ptr,         # [T, 8] int32
-    expert_counts_ptr,    # [E_LOCAL] int32 (output, zeroed before call)
-    local_start, T,
-):
-    """One CTA per token. Atomically increments count for each local expert."""
-    pid = tl.program_id(0)
-    if pid >= T:
-        return
-
+    # ── Fused counting: topk_idx_arr is still in registers — no global-memory
+    # round-trip needed (cf. the former separate _count_expert_tokens pass). ──
     for k in tl.static_range(8):        # TOP_K = 8
-        eid      = tl.load(topk_idx_ptr + pid * 8 + k)
+        eid      = tl.sum(tl.where(k_ids == k, topk_idx_arr, 0)).to(tl.int32)
         lid      = eid - local_start
         is_local = (lid >= 0) & (lid < 32)  # E_LOCAL = 32
         tl.atomic_add(expert_counts_ptr + tl.where(is_local, lid, 0), 1, mask=is_local)
@@ -568,16 +570,14 @@ def kernel(
     ws['sorted_weights'].zero_()        # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
     ws['token_slot_map'].fill_(gcap)    # reset sentinel; scatter will overwrite local assignments
 
-    # ── 1. Fused routing (Triton, 1 kernel) ──────────────────────────────────
+    # ── 1+2. Fused routing + counting (Triton, 1 kernel) ────────────────────
+    # topk_idx_arr is live in registers at the end of routing, so counting is
+    # free — no global-memory write→read round-trip between the two old kernels.
     _routing_kernel[(T,)](
         routing_logits, routing_bias,
         ws['topk_idx'], ws['topk_weights'],
-        T, routed_scaling_factor,
-    )
-
-    # ── 2. Count tokens per local expert (Triton, 1 kernel) ──────────────────
-    _count_expert_tokens[(T,)](
-        ws['topk_idx'], ws['expert_counts'], local_start, T,
+        ws['expert_counts'],
+        T, local_start, routed_scaling_factor,
     )
 
     # ── 3. Triton prefix sum (replaces aten::cumsum + aten::to + aten::copy_) ──
