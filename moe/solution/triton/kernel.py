@@ -1,23 +1,19 @@
 """
-Triton FP8 Fused MoE kernel — v11
+Triton FP8 Fused MoE kernel — v12
 
-v11 vs v10:
-- Routing: replace PyTorch _compute_routing + _build_expert_map with three
-  Triton kernels and one merged CPU sync.
-  * _routing_kernel: one CTA per token; sigmoid+bias, group top-2 scores,
-    top-4 group selection, top-8 expert argmax, weight normalization.
-    Outputs topk_idx [T,8] int32 and topk_weights [T,8] f32.
-    Eliminates dense weights[T,256] (only 8/256 entries are non-zero).
-  * _count_expert_tokens: atomic-add per local expert token count.
-  * _scatter_sorted_tokens: atomic write_ptr per expert → sorted layout
-    without argsort (O(T) vs O(T log T)).
-  * CPU syncs: 2 → 1 (one .cpu() fetches all 33 offset ints at once).
-- GEMM kernels and SwiGLU unchanged from v10.
+v12 vs v11:
+- Zero CPU syncs: pre-allocate all workspace buffers keyed by (T, device).
+  sorted_weights zeroed each call → invalid entries contribute 0 to output.
+  Fixed GEMM grids use gcap=2*T instead of token_counts_cpu (no CPU sync).
+  Early-exit guard in GEMM kernels handles over-launched CTAs gracefully.
+- Per-call allocations: 7 → 3 zero_() GPU ops (near-zero cost).
+- GPU idle gap eliminated: routing → count → cumsum → scatter → GEMM1
+  flows without CPU blocking.
 
-Pipeline:
+Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — Triton; [T,8] indices + weights
   2. _count_expert_tokens    — Triton; expert token counts
-  3. GPU cumsum + 1 CPU sync — expert_offsets [E_LOCAL+1]
+  3. GPU cumsum (no CPU sync) — expert_offsets [E_LOCAL+1]
   4. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights
   5. _grouped_gemm1_swiglu   — FP8×FP8→float32 (FP8 tensor cores)
   6. _swiglu_inplace         — silu(up)*gate
@@ -44,6 +40,34 @@ QUANT_BLOCK = 128
 
 BLOCK_N = 128
 BLOCK_K = 128
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persistent workspace cache (eliminates per-call allocations and CPU syncs)
+# ─────────────────────────────────────────────────────────────────────────────
+_ws_cache: dict = {}
+
+
+def _ensure_workspace(T: int, device):
+    """Return (creating if needed) workspace tensors for batch size T."""
+    key = (T, str(device))
+    if key in _ws_cache:
+        return _ws_cache[key]
+    gcap = max(T * 2, 128)   # capacity: 2× expected total_tokens
+    ws = {
+        'topk_idx':         torch.empty((T, TOP_K),    dtype=torch.int32,   device=device),
+        'topk_weights':     torch.empty((T, TOP_K),    dtype=torch.float32, device=device),
+        'expert_counts':    torch.zeros(E_LOCAL,       dtype=torch.int32,   device=device),
+        'expert_offsets':   torch.zeros(E_LOCAL + 1,   dtype=torch.int32,   device=device),
+        'write_ptrs':       torch.empty(E_LOCAL,       dtype=torch.int32,   device=device),
+        'sorted_token_ids': torch.zeros(gcap,          dtype=torch.int32,   device=device),
+        'sorted_weights':   torch.zeros(gcap,          dtype=torch.float32, device=device),
+        'gemm1_out':        torch.zeros((gcap, 2 * I), dtype=torch.float32, device=device),
+        'gemm2_out':        torch.zeros((gcap, H),     dtype=torch.float32, device=device),
+        'gcap':             gcap,
+    }
+    _ws_cache[key] = ws
+    return ws
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Autotune configs
@@ -108,6 +132,9 @@ def _grouped_gemm1_swiglu(
         pid_e     = tl.where(found, e, pid_e)
         pid_m     = tl.where(found, pid_m_global - cum_m, pid_m)
         cum_m     = new_cum
+
+    if pid_m_global >= cum_m:
+        return   # over-launched CTA (fixed grid); no actual data here
 
     e_start = tl.load(expert_offsets_ptr + pid_e).to(tl.int32)
     e_end   = tl.load(expert_offsets_ptr + pid_e + 1).to(tl.int32)
@@ -205,6 +232,9 @@ def _grouped_gemm2(
         pid_e     = tl.where(found, e, pid_e)
         pid_m     = tl.where(found, pid_m_global - cum_m, pid_m)
         cum_m     = new_cum
+
+    if pid_m_global >= cum_m:
+        return   # over-launched CTA (fixed grid); no actual data here
 
     e_start = tl.load(expert_offsets_ptr + pid_e).to(tl.int32)
     e_end   = tl.load(expert_offsets_ptr + pid_e + 1).to(tl.int32)
@@ -367,41 +397,6 @@ def _scatter_sorted_tokens(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing reference (kept for debug_correctness.py; not called by kernel())
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _compute_routing(routing_logits, routing_bias, routed_scaling_factor):
-    T = routing_logits.shape[0]
-
-    s      = torch.sigmoid(routing_logits)
-    s_bias = s + routing_bias.to(torch.float32)
-
-    s_grouped    = s_bias.view(T, N_GROUP, E_GLOBAL // N_GROUP)
-    top2, _      = torch.topk(s_grouped, k=2, dim=2, sorted=False)
-    group_scores = top2.sum(dim=2)
-
-    _, grp_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, sorted=False)
-    grp_mask   = torch.zeros_like(group_scores)
-    grp_mask.scatter_(1, grp_idx, 1.0)
-    score_mask = (
-        grp_mask.unsqueeze(2)
-        .expand(T, N_GROUP, E_GLOBAL // N_GROUP)
-        .reshape(T, E_GLOBAL)
-    )
-
-    masked      = s_bias.masked_fill(score_mask == 0, float("-inf"))
-    _, topk_idx = torch.topk(masked, k=TOP_K, dim=1, sorted=False)
-
-    weight_mask = torch.zeros_like(s)
-    weight_mask.scatter_(1, topk_idx, 1.0)
-    weights = s * weight_mask
-    weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-20)
-    weights = weights * routed_scaling_factor
-
-    return topk_idx, weights
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Entry point (destination-passing style: output is the last argument)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -423,93 +418,89 @@ def kernel(
     device = hidden_states.device
     local_start = int(local_expert_offset)
 
+    # ── Get/create persistent workspace (zero per-call allocation overhead) ──
+    ws = _ensure_workspace(T, device)
+    gcap = ws['gcap']
+
+    # ── Re-init mutable buffers (all GPU ops, near-zero latency) ─────────────
+    ws['expert_counts'].zero_()
+    ws['expert_offsets'].zero_()
+    ws['sorted_weights'].zero_()   # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
+
     # ── 1. Fused routing (Triton, 1 kernel) ──────────────────────────────────
-    topk_idx     = torch.empty((T, TOP_K), dtype=torch.int32,   device=device)
-    topk_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
     _routing_kernel[(T,)](
         routing_logits, routing_bias,
-        topk_idx, topk_weights,
+        ws['topk_idx'], ws['topk_weights'],
         T, routed_scaling_factor,
     )
 
     # ── 2. Count tokens per local expert (Triton, 1 kernel) ──────────────────
-    expert_counts = torch.zeros(E_LOCAL, dtype=torch.int32, device=device)
     _count_expert_tokens[(T,)](
-        topk_idx, expert_counts, local_start, T,
+        ws['topk_idx'], ws['expert_counts'], local_start, T,
     )
 
-    # ── 3. GPU prefix sum + ONE CPU sync (33 int32s) ─────────────────────────
-    expert_offsets_gpu = torch.zeros(E_LOCAL + 1, dtype=torch.int32, device=device)
-    expert_offsets_gpu[1:] = expert_counts.cumsum(0).to(torch.int32)
-    expert_offsets_cpu = expert_offsets_gpu.cpu()
-    total_tokens     = int(expert_offsets_cpu[-1])
-    token_counts_cpu = (expert_offsets_cpu[1:] - expert_offsets_cpu[:-1]).tolist()
-
-    if total_tokens == 0:
-        output.zero_()
-        return
+    # ── 3. GPU prefix sum (no CPU sync) ──────────────────────────────────────
+    ws['expert_offsets'][1:] = ws['expert_counts'].cumsum(0).to(torch.int32)
+    ws['write_ptrs'].copy_(ws['expert_offsets'][:-1])
 
     # ── 4. Scatter tokens into sorted layout (Triton, 1 kernel) ──────────────
-    sorted_token_ids = torch.empty(total_tokens, dtype=torch.int32,   device=device)
-    sorted_weights   = torch.empty(total_tokens, dtype=torch.float32, device=device)
-    write_ptrs       = expert_offsets_gpu[:-1].clone()
     _scatter_sorted_tokens[(T,)](
-        topk_idx, topk_weights, write_ptrs,
-        sorted_token_ids, sorted_weights,
+        ws['topk_idx'], ws['topk_weights'], ws['write_ptrs'],
+        ws['sorted_token_ids'], ws['sorted_weights'],
         local_start, T,
     )
 
-    # ── 5. Gather sorted hidden states ────────────────────────────────────────
-    sorted_A       = hidden_states[sorted_token_ids].contiguous()
-    sorted_A_scale = hidden_states_scale[:, sorted_token_ids].contiguous()
+    # ── 5. Gather sorted hidden states (gcap rows; invalid rows read row 0) ──
+    sorted_A       = hidden_states[ws['sorted_token_ids']].contiguous()
+    sorted_A_scale = hidden_states_scale[:, ws['sorted_token_ids']].contiguous()
 
-    # ── 6. Grouped GEMM1 → [total_tokens, 2*I] f32 ───────────────────────────
+    # ── 6. Grouped GEMM1 → [gcap, 2*I] f32 ──────────────────────────────────
     N1 = 2 * I
-    gemm1_out = torch.empty((total_tokens, N1), dtype=torch.float32, device=device)
-
+    # Grid M-dim: ceil(gcap/BM) + E_LOCAL.
+    # cum_m <= total_tokens/BM + E_LOCAL (each expert adds at most 1 partial tile),
+    # so grid_m >= cum_m always (given total_tokens <= gcap).
     grid1 = lambda meta: (
-        sum((int(tc) + meta['BLOCK_M'] - 1) // meta['BLOCK_M'] for tc in token_counts_cpu),
+        triton.cdiv(gcap, meta['BLOCK_M']) + E_LOCAL,
         triton.cdiv(N1, meta['BLOCK_N']),
     )
     _grouped_gemm1_swiglu[grid1](
         sorted_A,       sorted_A_scale,
         gemm1_weights,  gemm1_weights_scale,
-        gemm1_out,
-        expert_offsets_gpu,
-        N1, H, total_tokens,
+        ws['gemm1_out'],
+        ws['expert_offsets'],
+        N1, H, gcap,
         sorted_A.stride(0),       sorted_A.stride(1),
         sorted_A_scale.stride(0), sorted_A_scale.stride(1),
         gemm1_weights.stride(0),  gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
-        gemm1_out.stride(0),      gemm1_out.stride(1),
+        ws['gemm1_out'].stride(0), ws['gemm1_out'].stride(1),
     )
 
-    # ── 7. SwiGLU in-place ───────────────────────────────────────────────────
+    # ── 7. SwiGLU in-place ────────────────────────────────────────────────────
     _swiglu_inplace[
-        (triton.cdiv(total_tokens, 32), triton.cdiv(I, 128))
-    ](gemm1_out, total_tokens, I=I, BLOCK_M=32, BLOCK_I=128)
+        (triton.cdiv(gcap, 32), triton.cdiv(I, 128))
+    ](ws['gemm1_out'], gcap, I=I, BLOCK_M=32, BLOCK_I=128)
 
-    # ── 8. Grouped GEMM2 → [total_tokens, H] ─────────────────────────────────
-    gemm2_out = torch.empty((total_tokens, H), dtype=torch.float32, device=device)
-
+    # ── 8. Grouped GEMM2 → [gcap, H] ─────────────────────────────────────────
     grid2 = lambda meta: (
-        sum((int(tc) + meta['BLOCK_M'] - 1) // meta['BLOCK_M'] for tc in token_counts_cpu),
+        triton.cdiv(gcap, meta['BLOCK_M']) + E_LOCAL,
         triton.cdiv(H, meta['BLOCK_N']),
     )
     _grouped_gemm2[grid2](
-        gemm1_out,
+        ws['gemm1_out'],
         gemm2_weights, gemm2_weights_scale,
-        gemm2_out,
-        expert_offsets_gpu,
-        H, I, total_tokens,
-        gemm1_out.stride(0),      gemm1_out.stride(1),
+        ws['gemm2_out'],
+        ws['expert_offsets'],
+        H, I, gcap,
+        ws['gemm1_out'].stride(0), ws['gemm1_out'].stride(1),
         gemm2_weights.stride(0),  gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
-        gemm2_out.stride(0),      gemm2_out.stride(1),
+        ws['gemm2_out'].stride(0), ws['gemm2_out'].stride(1),
     )
 
     # ── 9. Weighted scatter + cast ────────────────────────────────────────────
-    weighted = gemm2_out * sorted_weights.unsqueeze(1)
+    # invalid workspace rows: sorted_weights = 0 → weighted = 0 → no output contribution
+    weighted = ws['gemm2_out'] * ws['sorted_weights'].unsqueeze(1)
     out_f32  = torch.zeros((T, H), dtype=torch.float32, device=device)
-    out_f32.index_add_(0, sorted_token_ids.long(), weighted)
+    out_f32.index_add_(0, ws['sorted_token_ids'].long(), weighted)
     output.copy_(out_f32)
