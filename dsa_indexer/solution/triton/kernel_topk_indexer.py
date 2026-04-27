@@ -9,9 +9,8 @@ Strategy:
     score[t] = sum_h weights[h] * ReLU( Q[h] . K[t] * scale[t] )
              = sum_h weights[h] * ReLU( scale[t] * (Q[h] . K[t]) )
              = sum_h weights[h] * max(0, scale[t] * acc_fp8[h, t])
-  This matches idxerv3's observation that scale must be applied INSIDE the
-  ReLU (scale can be negative because it comes from random bytes in the
-  test data).
+  Scale must be applied INSIDE the ReLU (scale can be negative because it
+  comes from random bytes in the test data).
 - Saves 4x HBM traffic on K (no float32 intermediate) and uses sm_100
   Tensor Cores for the 64x128x64 MMA.
 
