@@ -36,6 +36,18 @@ Options:
                                  means run all.
                                  Default: 0 (run all)
 
+    --baseline TEXT              Which baseline(s) to compare against.
+                                 - "torch":      vs PyTorch reference only (fast,
+                                                 works on any GPU).
+                                 - "flashinfer": vs FlashInfer baseline only
+                                                 (skips torch ref column).
+                                 - "both":       both columns (default). On B200
+                                                 this matches the official
+                                                 evaluator. On H100 the flashinfer
+                                                 path may not represent its
+                                                 optimized target — relative
+                                                 numbers are dev-only.
+                                 Default: both
 """
 
 from __future__ import annotations
@@ -91,6 +103,7 @@ def pack_and_run(
     max_workloads: int = None,
     debug: bool = False,
     profile: bool = False,
+    baseline: str = "both",
 ) -> dict:
     """Run entirely on the Modal Linux container.
 
@@ -154,10 +167,30 @@ def pack_and_run(
         workloads = workloads[:max_workloads]
         print(f"DEBUG MODE: running only the first {len(workloads)} workloads")
 
+    # Optionally include the FlashInfer baseline solution shipped in the dataset
+    # (e.g. flashinfer_wrapper_9sdjf3 for MoE). TraceSet.from_path already loaded
+    # solutions/baseline/**/*.json into trace_set.solutions[definition].
+    solutions_to_run = [solution]
+    flashinfer_solution_name = None
+    if baseline in ("flashinfer", "both"):
+        existing = trace_set.solutions.get(definition, [])
+        fi_sols = [s for s in existing if s.author == "flashinfer"]
+        if not fi_sols:
+            print(
+                f"WARNING: --baseline={baseline} requested but no flashinfer baseline "
+                f"found in dataset for {definition}. Falling back to torch ref only."
+            )
+            baseline = "torch"
+        else:
+            fi_sol = fi_sols[0]
+            flashinfer_solution_name = fi_sol.name
+            solutions_to_run.append(fi_sol)
+            print(f"Including FlashInfer baseline: {fi_sol.name}")
+
     bench_ts = TraceSet(
         root=trace_set.root,
         definitions={definition: trace_set.definitions[definition]},
-        solutions={definition: [solution]},
+        solutions={definition: solutions_to_run},
         workloads={definition: workloads},
         traces={definition: []},
     )
@@ -165,10 +198,18 @@ def pack_and_run(
     bench_cfg = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
     result_ts = Benchmark(bench_ts, bench_cfg).run_all(dump_traces=True)
 
-    results = {}
+    # Pass 1: collect every trace keyed by (workload_uuid, solution_name) so we
+    # can pair your kernel against each baseline.
+    by_workload: dict = {}
     for trace in result_ts.traces.get(definition, []):
         if not trace.evaluation:
             continue
+        # In flashinfer_bench traces, .workload and .solution are stored as
+        # name/uuid strings, not the full objects.
+        wl_obj = trace.workload
+        wl_uuid = str(wl_obj.uuid) if hasattr(wl_obj, "uuid") else str(wl_obj)
+        sol_obj = trace.solution
+        sol_name = sol_obj.name if hasattr(sol_obj, "name") else str(sol_obj)
         entry = {
             "status": trace.evaluation.status.value,
             "log": trace.evaluation.log,
@@ -177,16 +218,35 @@ def pack_and_run(
             p = trace.evaluation.performance
             entry["latency_ms"] = p.latency_ms
             entry["reference_latency_ms"] = p.reference_latency_ms
-            entry["speedup_factor"] = p.speedup_factor
+            entry["speedup_vs_torch"] = p.speedup_factor
         if trace.evaluation.correctness:
             c = trace.evaluation.correctness
             entry["max_abs_error"] = c.max_absolute_error
             entry["max_rel_error"] = c.max_relative_error
-        results[str(trace.workload.uuid)] = entry
+        by_workload.setdefault(wl_uuid, {})[sol_name] = entry
+
+    # Pass 2: build result rows for *your* solution; attach flashinfer latency
+    # and derived speedup_vs_flashinfer when available.
+    your_name = solution.name
+    results = {}
+    for wl_uuid, sols in by_workload.items():
+        your = sols.get(your_name)
+        if your is None:
+            continue
+        entry = dict(your)
+        if flashinfer_solution_name and flashinfer_solution_name in sols:
+            fi = sols[flashinfer_solution_name]
+            fi_lat = fi.get("latency_ms")
+            your_lat = your.get("latency_ms")
+            entry["flashinfer_latency_ms"] = fi_lat
+            entry["flashinfer_status"] = fi.get("status")
+            if fi_lat is not None and your_lat is not None and your_lat > 0:
+                entry["speedup_vs_flashinfer"] = fi_lat / your_lat
+        results[wl_uuid] = entry
 
     # Print results inside the container too, so the speedup table is visible
     # even when run with --detach (where local main() exits before remote returns).
-    print_results(results)
+    print_results(results, baseline=baseline)
 
     return results
 
@@ -236,52 +296,85 @@ def _load_track_sources(track: str) -> tuple[dict, dict]:
     return sources, config
 
 
-def print_results(results: dict):
+def print_results(results: dict, baseline: str = "both"):
     """Format and print the results dict returned from pack_and_run."""
-    print(f"\n{'Workload':<12} {'Status':<14} {'Latency (ms)':<16} {'Speedup':<12} {'abs_err'}")
-    print("-" * 72)
+    show_torch = baseline in ("torch", "both")
+    show_fi = baseline in ("flashinfer", "both")
 
-    latencies, speedups = [], []
+    headers = [f"{'Workload':<12}", f"{'Status':<14}", f"{'Latency (ms)':<14}"]
+    if show_torch:
+        headers.append(f"{'vs torch':<12}")
+    if show_fi:
+        headers.append(f"{'vs flashinfer':<16}")
+    headers.append("abs_err")
+    print("\n" + " ".join(headers))
+    print("-" * sum(len(h) + 1 for h in headers))
+
+    latencies, sp_torch, sp_fi = [], [], []
     for uuid, r in sorted(results.items()):
         status = r.get("status", "?")
         lat = r.get("latency_ms")
-        speedup = r.get("speedup_factor")
+        st = r.get("speedup_vs_torch")
+        sf = r.get("speedup_vs_flashinfer")
         abs_err = r.get("max_abs_error")
 
         lat_str = f"{lat:.4f}" if lat is not None else "N/A"
-        speedup_str = f"{speedup:.3f}x" if speedup is not None else "N/A"
+        st_str = f"{st:.3f}x" if st is not None else "N/A"
+        sf_str = f"{sf:.3f}x" if sf is not None else "N/A"
         err_str = f"{abs_err:.2e}" if abs_err is not None else "N/A"
 
-        print(f"{uuid[:8]:<12} {status:<14} {lat_str:<16} {speedup_str:<12} {err_str}")
+        cols = [f"{uuid[:8]:<12}", f"{status:<14}", f"{lat_str:<14}"]
+        if show_torch:
+            cols.append(f"{st_str:<12}")
+        if show_fi:
+            cols.append(f"{sf_str:<16}")
+        cols.append(err_str)
+        print(" ".join(cols))
 
         if lat is not None:
             latencies.append(lat)
-        if speedup is not None:
-            speedups.append(speedup)
+        if st is not None:
+            sp_torch.append(st)
+        if sf is not None:
+            sp_fi.append(sf)
 
     if latencies:
         import statistics
         print(f"\nSummary ({len(latencies)} workloads):")
         print(f"  Latency — min: {min(latencies):.4f} ms  max: {max(latencies):.4f} ms  median: {statistics.median(latencies):.4f} ms")
-    if speedups:
+    if sp_torch:
         import statistics
-        print(f"  Speedup — min: {min(speedups):.3f}x  max: {max(speedups):.3f}x  mean: {statistics.mean(speedups):.3f}x")
+        print(f"  vs torch       — min: {min(sp_torch):.3f}x  max: {max(sp_torch):.3f}x  mean: {statistics.mean(sp_torch):.3f}x")
+    if sp_fi:
+        import statistics
+        print(f"  vs flashinfer  — min: {min(sp_fi):.3f}x  max: {max(sp_fi):.3f}x  mean: {statistics.mean(sp_fi):.3f}x")
 
-    worst = None
-    worst_err = -1.0
-    for uuid, r in results.items():
-        if r.get("status") != "PASSED" and r.get("log"):
-            err = r.get("max_abs_error") or 0
-            if err > worst_err:
-                worst_err = err
-                worst = (uuid, r)
-    if worst is not None:
-        uuid, r = worst
+    # Print log for *any* non-PASSED workload (NaN errors don't compare via >).
+    # Sort by descending err with NaN last, take the first failure with a log.
+    import math
+
+    def _err_key(item):
+        err = item[1].get("max_abs_error")
+        if err is None or (isinstance(err, float) and math.isnan(err)):
+            return -1.0
+        return err
+
+    fails = [
+        (uuid, r) for uuid, r in results.items()
+        if r.get("status") != "PASSED"
+    ]
+    fails.sort(key=_err_key, reverse=True)
+    for uuid, r in fails:
+        log = r.get("log") or "<no log captured>"
+        err = r.get("max_abs_error")
+        err_str = f"{err:.2e}" if err is not None else "N/A"
         print("\n" + "=" * 70)
-        print(f"Worst failure log ({uuid[:8]}..., {r.get('status')}, abs_err={worst_err:.2e}):")
+        print(f"Failure log ({uuid[:8]}..., {r.get('status')}, abs_err={err_str}):")
         print("=" * 70)
-        print(r["log"])
+        print(log)
         print("=" * 70)
+        # Only print first to avoid flooding when many fails.
+        break
 
 
 @app.local_entrypoint()
@@ -290,12 +383,16 @@ def main(
     debug: bool = False,
     profile: bool = False,
     max_workloads: int = 0,
+    baseline: str = "both",
 ):
     """Pack the solution for one track and run benchmark on Modal."""
+    if baseline not in ("torch", "flashinfer", "both"):
+        raise ValueError(f"--baseline must be torch|flashinfer|both, got {baseline!r}")
+
     print(f"Loading sources for track '{track}'...")
     sources, config = _load_track_sources(track)
     print(f"Sending {len(sources)} file(s) to Modal: {list(sources.keys())}")
-    print(f"Running on Modal {MODAL_GPU}...")
+    print(f"Running on Modal {MODAL_GPU} (baseline={baseline})...")
 
     workload_limit = max_workloads if max_workloads and max_workloads > 0 else None
     results = pack_and_run.remote(
@@ -304,10 +401,11 @@ def main(
         max_workloads=workload_limit,
         debug=debug,
         profile=profile,
+        baseline=baseline,
     )
 
     if not results:
         print("No results returned!")
         return
 
-    print_results(results)
+    print_results(results, baseline=baseline)

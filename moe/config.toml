@@ -5,4 +5,4 @@ author = "JensenHireMe"
 
 [build]
 language = "triton"
-entry_point = "kernel_cute.py::kernel"
+entry_point = "kernel.py::kernel"

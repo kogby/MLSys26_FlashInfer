@@ -141,141 +141,134 @@ try:
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
             # ── per-expert M range ────────────────────────────────────────────
+            # CuTe DSL forbids dynamic early-return inside @cute.kernel; instead
+            # wrap the whole body in `if m_local_start < M_e`. Out-of-range CTAs
+            # do nothing (no smem alloc, no MMA, no store) but still walk the
+            # function epilogue.
             e_start = EO[pid_e]
             e_end = EO[pid_e + 1]
             M_e = e_end - e_start
             m_local_start = pid_m * cutlass.Int32(_BLOCK_M_CUTE)
-            if m_local_start >= M_e:
-                return  # CTA out of range for this expert (incl. M_e == 0)
 
-            # ── SMEM allocation ───────────────────────────────────────────────
-            alloc = cute_utils.SmemAllocator()
-            sA = alloc.allocate_tensor(
-                element_type=ab_dtype, layout=a_smem_layout.outer,
-                byte_alignment=128, swizzle=a_smem_layout.inner,
-            )
-            sB = alloc.allocate_tensor(
-                element_type=ab_dtype, layout=b_smem_layout.outer,
-                byte_alignment=128, swizzle=b_smem_layout.inner,
-            )
-            storage = alloc.allocate(self.shared_storage)
-            mma_mbar = storage.mma_mbar_ptr.data_ptr()
-
-            # ── TMEM accumulator setup ────────────────────────────────────────
-            acc_shape = tiled_mma.partition_shape_C(_CTA_TILE_MNK[:2])
-            tCtAcc_tmpl = tiled_mma.make_fragment_C(acc_shape)
-            num_tmem_cols = cute_utils.get_num_tmem_alloc_cols(tCtAcc_tmpl)
-            if warp_idx == 0:
-                cute.arch.alloc_tmem(
-                    cutlass.Int32(num_tmem_cols), storage.tmem_holding_buf,
+            if m_local_start < M_e:
+                # ── SMEM allocation ───────────────────────────────────────────
+                alloc = cute_utils.SmemAllocator()
+                sA = alloc.allocate_tensor(
+                    element_type=ab_dtype, layout=a_smem_layout.outer,
+                    byte_alignment=128, swizzle=a_smem_layout.inner,
                 )
-            cute.arch.barrier(barrier_id=1, number_of_threads=_THREADS_PER_CTA)
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                acc_dtype, alignment=16,
-                ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
-            )
-            tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_tmpl.layout)
-
-            # ── mbar init ────────────────────────────────────────────────────
-            if warp_idx == 0:
-                if tidx == 0:
-                    cute.arch.mbarrier_init(mma_mbar, cnt=1)
-                    cute.arch.mbarrier_init_fence()
-            cute.arch.barrier(barrier_id=1, number_of_threads=_THREADS_PER_CTA)
-
-            tCrA = tiled_mma.make_fragment_A(sA)
-            tCrB = tiled_mma.make_fragment_B(sB)
-            num_k_blocks = cute.size(tCrA, mode=[2])
-
-            # ── K-loop: for each BLOCK_K tile in I=2048 dim ──────────────────
-            mma_phase = cutlass.Int32(0)
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-            K_DIM: cutlass.Constexpr = I
-            num_k_tiles: cutlass.Constexpr = K_DIM // _BLOCK_K_CUTE  # 16
-
-            # Global row index for A: e_start + m_local_start + tidx (per-thread row)
-            for kb in cutlass.range_constexpr(num_k_tiles):
-                k_start = kb * cutlass.Int32(_BLOCK_K_CUTE)
-
-                # ── Load A tile (fp32) → cast TF32 → smem ─────────────────────
-                # A logical shape: [total_tokens, I], physical stride (2*I, 1).
-                # Each thread handles BLOCK_M*BLOCK_K / THREADS_PER_CTA = 128 elements.
-                ELEMS_PER_THREAD_A: cutlass.Constexpr = (
-                    _BLOCK_M_CUTE * _BLOCK_K_CUTE // _THREADS_PER_CTA
+                sB = alloc.allocate_tensor(
+                    element_type=ab_dtype, layout=b_smem_layout.outer,
+                    byte_alignment=128, swizzle=b_smem_layout.inner,
                 )
-                for i in cutlass.range_constexpr(ELEMS_PER_THREAD_A):
-                    flat_idx = tidx * cutlass.Int32(ELEMS_PER_THREAD_A) + cutlass.Int32(i)
-                    a_m = flat_idx // cutlass.Int32(_BLOCK_K_CUTE)
-                    a_k = flat_idx - a_m * cutlass.Int32(_BLOCK_K_CUTE)
-                    g_m = e_start + m_local_start + a_m
-                    g_k = k_start + a_k
-                    a_val = cutlass.Float32(0.0)
-                    if (e_start + m_local_start + a_m) < e_end:
-                        a_val = A[g_m, g_k]
-                    sA[a_m, a_k] = ab_dtype(a_val)
+                storage = alloc.allocate(self.shared_storage)
+                mma_mbar = storage.mma_mbar_ptr.data_ptr()
 
-                # ── Load B tile (fp8) → dequant fp32 → cast TF32 → smem ──────
-                # B[pid_e, n_start:n_end, k_start:k_end]
-                n_start = pid_n * cutlass.Int32(_BLOCK_N_CUTE)
-                # SB scalar for this (pid_e, pid_n, kb) tile
-                sb_scale = SB[
-                    pid_e,
-                    pid_n,  # H/128 block index = pid_n since BLOCK_N=128
-                    cutlass.Int32(kb),
-                ]
-                ELEMS_PER_THREAD_B: cutlass.Constexpr = (
-                    _BLOCK_N_CUTE * _BLOCK_K_CUTE // _THREADS_PER_CTA
-                )
-                for i in cutlass.range_constexpr(ELEMS_PER_THREAD_B):
-                    flat_idx = tidx * cutlass.Int32(ELEMS_PER_THREAD_B) + cutlass.Int32(i)
-                    b_n = flat_idx // cutlass.Int32(_BLOCK_K_CUTE)
-                    b_k = flat_idx - b_n * cutlass.Int32(_BLOCK_K_CUTE)
-                    fp8_val = B[pid_e, n_start + b_n, k_start + b_k]
-                    f32_val = cutlass.Float32(fp8_val) * sb_scale
-                    sB[b_n, b_k] = ab_dtype(f32_val)
-
-                cute.arch.sync_threads()
-                cute.arch.fence_view_async_shared()
-
-                # ── tcgen05 TF32 MMA (warp 0 only) ────────────────────────────
+                # ── TMEM accumulator setup ────────────────────────────────────
+                acc_shape = tiled_mma.partition_shape_C(_CTA_TILE_MNK[:2])
+                tCtAcc_tmpl = tiled_mma.make_fragment_C(acc_shape)
+                num_tmem_cols = cute_utils.get_num_tmem_alloc_cols(tCtAcc_tmpl)
                 if warp_idx == 0:
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_block_coord = (None, None, k_block_idx, 0)
-                        cute.gemm(
-                            tiled_mma, tCtAcc,
-                            tCrA[k_block_coord], tCrB[k_block_coord], tCtAcc,
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    cute.arch.alloc_tmem(
+                        cutlass.Int32(num_tmem_cols), storage.tmem_holding_buf,
+                    )
+                cute.arch.barrier(barrier_id=1, number_of_threads=_THREADS_PER_CTA)
+                tmem_ptr = cute.arch.retrieve_tmem_ptr(
+                    acc_dtype, alignment=16,
+                    ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
+                )
+                tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_tmpl.layout)
+
+                # ── mbar init ────────────────────────────────────────────────
+                if warp_idx == 0:
                     if tidx == 0:
-                        tcgen05.commit(mma_mbar)
-                cute.arch.mbarrier_wait(mma_mbar, mma_phase)
-                mma_phase = mma_phase ^ cutlass.Int32(1)
+                        cute.arch.mbarrier_init(mma_mbar, cnt=1)
+                        cute.arch.mbarrier_init_fence()
+                cute.arch.barrier(barrier_id=1, number_of_threads=_THREADS_PER_CTA)
+
+                tCrA = tiled_mma.make_fragment_A(sA)
+                tCrB = tiled_mma.make_fragment_B(sB)
+                num_k_blocks = cute.size(tCrA, mode=[2])
+
+                # ── K-loop: for each BLOCK_K tile in I=2048 dim ──────────────
+                mma_phase = cutlass.Int32(0)
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+                K_DIM: cutlass.Constexpr = I
+                num_k_tiles: cutlass.Constexpr = K_DIM // _BLOCK_K_CUTE  # 16
+
+                for kb in cutlass.range_constexpr(num_k_tiles):
+                    k_start = kb * cutlass.Int32(_BLOCK_K_CUTE)
+
+                    # ── Load A tile (fp32) → cast TF32 → smem ─────────────────
+                    ELEMS_PER_THREAD_A: cutlass.Constexpr = (
+                        _BLOCK_M_CUTE * _BLOCK_K_CUTE // _THREADS_PER_CTA
+                    )
+                    for i in cutlass.range_constexpr(ELEMS_PER_THREAD_A):
+                        flat_idx = tidx * cutlass.Int32(ELEMS_PER_THREAD_A) + cutlass.Int32(i)
+                        a_m = flat_idx // cutlass.Int32(_BLOCK_K_CUTE)
+                        a_k = flat_idx - a_m * cutlass.Int32(_BLOCK_K_CUTE)
+                        g_m = e_start + m_local_start + a_m
+                        g_k = k_start + a_k
+                        a_val = cutlass.Float32(0.0)
+                        if (e_start + m_local_start + a_m) < e_end:
+                            a_val = A[g_m, g_k]
+                        sA[a_m, a_k] = ab_dtype(a_val)
+
+                    # ── Load B tile (fp8) → dequant + scale → cast TF32 → smem
+                    n_start = pid_n * cutlass.Int32(_BLOCK_N_CUTE)
+                    sb_scale = SB[pid_e, pid_n, cutlass.Int32(kb)]
+                    ELEMS_PER_THREAD_B: cutlass.Constexpr = (
+                        _BLOCK_N_CUTE * _BLOCK_K_CUTE // _THREADS_PER_CTA
+                    )
+                    for i in cutlass.range_constexpr(ELEMS_PER_THREAD_B):
+                        flat_idx = tidx * cutlass.Int32(ELEMS_PER_THREAD_B) + cutlass.Int32(i)
+                        b_n = flat_idx // cutlass.Int32(_BLOCK_K_CUTE)
+                        b_k = flat_idx - b_n * cutlass.Int32(_BLOCK_K_CUTE)
+                        fp8_val = B[pid_e, n_start + b_n, k_start + b_k]
+                        f32_val = cutlass.Float32(fp8_val) * sb_scale
+                        sB[b_n, b_k] = ab_dtype(f32_val)
+
+                    cute.arch.sync_threads()
+                    cute.arch.fence_view_async_shared()
+
+                    # ── tcgen05 TF32 MMA (warp 0 only) ────────────────────────
+                    if warp_idx == 0:
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                            k_block_coord = (None, None, k_block_idx, 0)
+                            cute.gemm(
+                                tiled_mma, tCtAcc,
+                                tCrA[k_block_coord], tCrB[k_block_coord], tCtAcc,
+                            )
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        if tidx == 0:
+                            tcgen05.commit(mma_mbar)
+                    cute.arch.mbarrier_wait(mma_mbar, mma_phase)
+                    mma_phase = mma_phase ^ cutlass.Int32(1)
+                    cute.arch.sync_threads()
+
+                # ── Epilogue: TMEM → rmem fp32 → gmem with M_e mask ──────────
+                M_acc = cute.size(tCtAcc, mode=[0, 0])
+                ld_op = tcgen05.Ld32x32bOp(tcgen05.Repetition(_BLOCK_N_CUTE))
+                epi_tiler = ((M_acc, _BLOCK_N_CUTE),)
+                tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
+                copy_atom_t2r = cute.make_copy_atom(ld_op, acc_dtype)
+                tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi[None, 0])
+                tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
+                tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
+                tTR_rAcc = cute.make_rmem_tensor(tTR_tAcc[None, None, 0].shape, acc_dtype)
+
+                if tidx < cutlass.Int32(_BLOCK_M_CUTE):
+                    cute.copy(tmem_tiled_copy, tTR_tAcc[None, None, 0], tTR_rAcc)
+
+                    m_local = m_local_start + tidx
+                    g_m = e_start + m_local
+                    if m_local < M_e:
+                        for n_idx in cutlass.range_constexpr(_BLOCK_N_CUTE):
+                            n_global = pid_n * cutlass.Int32(_BLOCK_N_CUTE) + cutlass.Int32(n_idx)
+                            C[g_m, n_global] = tTR_rAcc[n_idx]
+
                 cute.arch.sync_threads()
-
-            # ── Epilogue: TMEM → rmem fp32 → gmem with M_e mask ───────────────
-            # Use tcgen05 TMEM load. Each thread reads a slice of acc rows.
-            M_acc = cute.size(tCtAcc, mode=[0, 0])
-            ld_op = tcgen05.Ld32x32bOp(tcgen05.Repetition(_BLOCK_N_CUTE))
-            epi_tiler = ((M_acc, _BLOCK_N_CUTE),)
-            tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
-            copy_atom_t2r = cute.make_copy_atom(ld_op, acc_dtype)
-            tmem_tiled_copy = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi[None, 0])
-            tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-            tTR_tAcc = tmem_thr_copy.partition_S(tCtAcc_epi)
-            tTR_rAcc = cute.make_rmem_tensor(tTR_tAcc[None, None, 0].shape, acc_dtype)
-
-            if tidx < cutlass.Int32(_BLOCK_M_CUTE):
-                cute.copy(tmem_tiled_copy, tTR_tAcc[None, None, 0], tTR_rAcc)
-
-                m_local = m_local_start + tidx
-                g_m = e_start + m_local
-                if m_local < M_e:
-                    for n_idx in cutlass.range_constexpr(_BLOCK_N_CUTE):
-                        n_global = pid_n * cutlass.Int32(_BLOCK_N_CUTE) + cutlass.Int32(n_idx)
-                        C[g_m, n_global] = tTR_rAcc[n_idx]
-
-            cute.arch.sync_threads()
 
     def _compile_gemm2(instance):
         T_ = cute.sym_int()

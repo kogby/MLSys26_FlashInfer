@@ -1,38 +1,44 @@
 """
-Triton FP8 Fused MoE kernel — v17
+Triton FP8 Fused MoE kernel — v18
 
-v17 closes two CPU-GPU synchronization bubbles visible in the routing stage:
+v18 fuses the weighted output scatter into GEMM2's epilogue, eliminating the
+intermediate `gemm2_out [gcap, H] fp32` workspace and the `_weighted_output`
+gather kernel.
 
-  Gap 1 (after _count_expert_tokens, before _scatter_sorted_tokens):
-    Old: ws['expert_offsets'][1:] = ws['expert_counts'].cumsum(0).to(torch.int32)
-         ws['write_ptrs'].copy_(ws['expert_offsets'][:-1])
-    Three separate PyTorch dispatch round-trips (aten::cumsum, aten::to,
-    aten::copy_) for only 32 elements, each stalling the CUDA command queue.
-    New: single `_prefix_sum[(1,)](...)` Triton kernel — one CTA, 32 threads,
-    computes exclusive prefix sum in registers and writes both offsets and
-    write_ptrs in one shot.
+Old (v17) GEMM2 + scatter:
+  GEMM2 epilogue:    tl.store(gemm2_out[rm, rn], acc)              # [gcap, H] fp32 write
+  _weighted_output:  acc = sum_k(gemm2_out[slot_k, :] * w[slot_k]) # [gcap, H] fp32 read
+                     output[t, :] = acc.to(bf16)                   # [T, H]    bf16 write
 
-  Gap 2 (after _scatter_sorted_tokens, before _grouped_gemm1_swiglu):
-    Old: sorted_A       = hidden_states[ws['sorted_token_ids']].contiguous()
-         sorted_A_scale = hidden_states_scale[:, ws['sorted_token_ids']].contiguous()
-    Two aten::index fancy-gather kernels allocating [gcap, H] and [H//128, gcap]
-    tensors. Fused into _grouped_gemm1_swiglu via a new `token_ids_ptr`
-    argument: each CTA loads tok = sorted_token_ids[rm] once before the K-loop,
-    then reads hidden_states[tok, :] and hidden_states_scale[kb, tok] directly.
-    Zero extra allocation, zero extra kernels.
+New (v18) GEMM2 + scatter (fused):
+  GEMM2 epilogue:    tok = sorted_token_ids[rm]                    # original token row
+                     w   = sorted_weights[rm]                      # routing weight
+                     atomic_add(out_f32[tok, rn], acc * w[:, None])
+  _cast_f32_to_bf16: output[t, :] = out_f32[t, :].to(bf16)         # [T, H] bf16 write
 
-v16 (previous):
-- Token-parallel _weighted_output gather replaces index_add_ scatter.
+What this saves (T=1024, gcap=2048):
+  - gemm2_out [gcap, H] fp32: 56MB write + 56MB read eliminated
+  - token_slot_map [T, TOP_K]: ~32KB workspace eliminated
+  - one full kernel launch (_weighted_output)
+
+What it costs:
+  - out_f32 [T, H] fp32: 28MB workspace (must be zeroed each call)
+  - per-tile atomic_add into out_f32: contention is bounded by overlap between
+    experts mapped to the same token (top_k=8, but each (token, expert) pair
+    appears at most once in sorted layout, so contention only occurs across
+    different K-tile experts writing the same output row)
+  - GEMM2 epilogue carries 2 extra loads (tok, w) before the K-loop — register
+    pressure was a v9c regression risk; loaded once outside the K-loop so it
+    does not affect the inner-loop accumulator working set.
 
 Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — Triton; [T,8] indices + weights + fused counting
   2. _prefix_sum             — Triton; expert_offsets [E_LOCAL+1] + write_ptrs
-  3. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
-                               token_slot_map
+  3. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights
   4. _grouped_gemm1_swiglu   — FP8×FP8→float32 with inline token gather
   5. _swiglu_to_fp16_scaled  — silu(up)*gate FP32; per-row/per-128 scale → FP16
-  6. _grouped_gemm2          — FP16×FP16→float32 with two-sided block scaling
-  7. _weighted_output        — gather gemm2_out via slot_map → bf16 output
+  6. _grouped_gemm2_weighted — FP16×FP16→float32, atomic-add weighted into out_f32
+  7. _cast_f32_to_bf16       — out_f32 [T,H] → output [T,H] bf16
 """
 
 import torch
@@ -74,13 +80,13 @@ def _ensure_workspace(T: int, device):
         'write_ptrs':       torch.empty(E_LOCAL,       dtype=torch.int32,   device=device),
         'sorted_token_ids': torch.zeros(gcap,          dtype=torch.int32,   device=device),
         'sorted_weights':   torch.zeros(gcap,          dtype=torch.float32, device=device),
-        # token_slot_map[t, k] = workspace slot for token t's k-th top-k expert,
-        # or gcap (sentinel) if that assignment is not a local expert.
-        'token_slot_map':   torch.full((T, TOP_K), gcap, dtype=torch.int32, device=device),
         'gemm1_out':        torch.zeros((gcap, 2 * I), dtype=torch.float32, device=device),
         'swiglu_fp16':      torch.empty((gcap, I),     dtype=torch.float16, device=device),
         'swiglu_scale_a':   torch.empty((I // QUANT_BLOCK, gcap), dtype=torch.float32, device=device),
-        'gemm2_out':        torch.zeros((gcap, H),     dtype=torch.float32, device=device),
+        # out_f32 [T, H] fp32 — atomic-add target for fused GEMM2 epilogue.
+        # Replaces gemm2_out [gcap, H] fp32 (saved ~8x for top_k=8 / gcap=2T).
+        # Must be zeroed each call before the GEMM2 launch.
+        'out_f32':          torch.zeros((T, H),        dtype=torch.float32, device=device),
         'gcap':             gcap,
     }
     _ws_cache[key] = ws
@@ -257,12 +263,22 @@ def _swiglu_to_fp16_scaled(
              scale, mask=mask_m)
 
 
-@triton.autotune(configs=_GEMM_CONFIGS, key=['N', 'K', 'total_tokens'])
+@triton.autotune(
+    configs=_GEMM_CONFIGS, key=['N', 'K', 'total_tokens'],
+    # autotune launches each config repeatedly to time it; with atomic_add into a
+    # persistent fp32 buffer those trials accumulate into out_f32, blowing up the
+    # values seen by the cast kernel on the *first* real call. reset_to_zero
+    # clears the accumulator before every trial — matches v9c's lesson.
+    reset_to_zero=['out_f32_ptr'],
+)
 @triton.jit
-def _grouped_gemm2(
+def _grouped_gemm2_weighted(
     A_ptr, SA_ptr,            # A: [total_tokens, K] FP16 ; SA: [K//128, total_tokens] FP32
     B_ptr, SB_ptr,            # B: FP8 weights, SB: per-128-block scales
-    C_ptr,                    # [total_tokens, N] FP32  (output)
+    # Fused-epilogue inputs (replace standalone _weighted_output kernel)
+    token_ids_ptr,            # [total_tokens] int32 — sorted_token_ids: workspace slot → output token row
+    weights_ptr,              # [total_tokens] f32   — sorted_weights: per-slot routing weight
+    out_f32_ptr,              # [T, H] f32           — atomic-add accumulator (must be zeroed by caller)
     expert_offsets_ptr,
     N, K,
     total_tokens,
@@ -270,7 +286,7 @@ def _grouped_gemm2(
     stride_sA_kb, stride_sA_m,
     stride_be, stride_bn, stride_bk,
     stride_sB_e, stride_sB_nb, stride_sB_kb,
-    stride_cm, stride_cn,
+    stride_om, stride_on,     # strides for out_f32 [T, H]
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -301,6 +317,13 @@ def _grouped_gemm2(
     rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rm       = e_start + rm_local
     rn       = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_m  = rm_local < M_e
+
+    # ── Epilogue inputs loaded once outside the K-loop (avoid v9c reg-pressure
+    # regression: keeping these out of the inner accumulator working set lets
+    # the autotuner still pick large BLOCK_M). ─────────────────────────────────
+    tok = tl.load(token_ids_ptr + rm, mask=valid_m, other=0)
+    w   = tl.load(weights_ptr   + rm, mask=valid_m, other=0.0)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -310,11 +333,11 @@ def _grouped_gemm2(
         # A is FP16 (per-row × per-128-K-block scaled SwiGLU output).
         a = tl.load(
             A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak,
-            mask=(rm_local[:, None] < M_e) & (rk[None, :] < K), other=0.0,
+            mask=valid_m[:, None] & (rk[None, :] < K), other=0.0,
         )
         sa = tl.load(
             SA_ptr + kb * stride_sA_kb + rm * stride_sA_m,
-            mask=rm_local < M_e, other=0.0,
+            mask=valid_m, other=0.0,
         )
 
         # B is FP8 → FP16 directly (lossless: FP8 max=448 fits, 3-bit
@@ -331,10 +354,15 @@ def _grouped_gemm2(
         partial = tl.dot(a, tl.trans(b_fp16), out_dtype=tl.float32)
         acc = acc + partial * sa[:, None] * sb
 
-    tl.store(
-        C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
-        acc,
-        mask=(rm_local[:, None] < M_e) & (rn[None, :] < N),
+    # ── Fused weighted scatter: atomic_add(out_f32[tok, rn], acc * w) ─────────
+    # Multiple tiles (different experts, same token) race here. atomic_add on
+    # fp32 in HBM is ~10-20× slower than tl.store, but we save the gemm2_out
+    # write+read (~2× the data) plus a full kernel launch.
+    weighted = acc * w[:, None]
+    tl.atomic_add(
+        out_f32_ptr + tok[:, None] * stride_om + rn[None, :] * stride_on,
+        weighted,
+        mask=valid_m[:, None] & (rn[None, :] < N),
     )
 
 
@@ -474,12 +502,13 @@ def _scatter_sorted_tokens(
     write_ptrs_ptr,        # [E_LOCAL] int32 — per-expert write cursor (clone of offsets[:-1])
     sorted_token_ids_ptr,  # [total_tokens] int32 (output)
     sorted_weights_ptr,    # [total_tokens] f32   (output)
-    slot_map_ptr,          # [T, TOP_K] int32 (output) — workspace slot per (token, top_k_k)
     local_start, T,
 ):
     """One CTA per token. Scatter each token into its expert's sorted slice.
-    Also fills slot_map[pid, k] = workspace slot for local assignments so the
-    output gather kernel can find each token's contributions without index_add_.
+
+    v18: slot_map output dropped — GEMM2's fused atomic-add epilogue resolves
+    workspace-slot → output-token directly via sorted_token_ids[rm], so the
+    reverse map is no longer needed.
     """
     pid = tl.program_id(0)
     if pid >= T:
@@ -496,46 +525,30 @@ def _scatter_sorted_tokens(
         pos = tl.atomic_add(write_ptrs_ptr + lid_safe, 1, mask=is_local)
         tl.store(sorted_token_ids_ptr + pos, pid, mask=is_local)
         tl.store(sorted_weights_ptr   + pos, w,   mask=is_local)
-        # Record which workspace slot this (token, top_k_k) maps to.
-        # Non-local k entries retain the gcap sentinel written during workspace init.
-        tl.store(slot_map_ptr + pid * 8 + k, pos, mask=is_local)
 
 
 @triton.jit
-def _weighted_output(
-    gemm2_out_ptr,       # [gcap, H] f32  — GEMM2 output
-    sorted_weights_ptr,  # [gcap] f32     — per-slot routing weight
-    slot_map_ptr,        # [T, TOP_K] int32 — workspace slot per (token, k); gcap = sentinel
-    out_ptr,             # [T, H] bf16    — final output (written directly)
-    T, H, gcap,
+def _cast_f32_to_bf16(
+    src_ptr,             # [T, H] f32  — out_f32 (atomic-add accumulated by GEMM2)
+    dst_ptr,             # [T, H] bf16 — final output
+    T, H,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Token-parallel gather: one CTA per (output token, column block).
+    """Plain elementwise fp32 → bf16 cast. One CTA per (M-block, N-block).
 
-    For each output token, reads up to TOP_K=8 rows from gemm2_out (identified
-    via slot_map), multiplies each by its routing weight, accumulates in float32,
-    then stores as bfloat16. Writes are coalesced (consecutive threads write
-    consecutive columns of the same token row). No atomics needed.
+    Replaces v17's _weighted_output: the weighted sum is already done inside
+    GEMM2's atomic_add epilogue, so this kernel just does a dtype conversion.
     """
-    pid_t = tl.program_id(0)
+    pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    rn     = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask_n = rn < H
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rm[:, None] < T) & (rn[None, :] < H)
 
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
-    for k in tl.static_range(8):          # TOP_K = 8
-        slot     = tl.load(slot_map_ptr + pid_t * 8 + k)
-        is_valid = slot < gcap             # gcap is sentinel for "not a local expert"
-        slot_s   = tl.where(is_valid, slot, 0)
-
-        w   = tl.load(sorted_weights_ptr + slot_s, mask=is_valid, other=0.0)
-        row = tl.load(gemm2_out_ptr + slot_s * H + rn,
-                      mask=is_valid & mask_n, other=0.0)
-        acc = acc + row * w
-
-    tl.store(out_ptr + pid_t * H + rn, acc.to(tl.bfloat16), mask=mask_n)
+    x = tl.load(src_ptr + rm[:, None] * H + rn[None, :], mask=mask, other=0.0)
+    tl.store(dst_ptr + rm[:, None] * H + rn[None, :], x.to(tl.bfloat16), mask=mask)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -568,7 +581,7 @@ def kernel(
     ws['expert_counts'].zero_()
     ws['expert_offsets'].zero_()
     ws['sorted_weights'].zero_()        # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
-    ws['token_slot_map'].fill_(gcap)    # reset sentinel; scatter will overwrite local assignments
+    ws['out_f32'].zero_()               # atomic-add target for fused GEMM2 epilogue
 
     # ── 1+2. Fused routing + counting (Triton, 1 kernel) ────────────────────
     # topk_idx_arr is live in registers at the end of routing, so counting is
@@ -592,7 +605,6 @@ def kernel(
     _scatter_sorted_tokens[(T,)](
         ws['topk_idx'], ws['topk_weights'], ws['write_ptrs'],
         ws['sorted_token_ids'], ws['sorted_weights'],
-        ws['token_slot_map'],
         local_start, T,
     )
 
@@ -634,29 +646,29 @@ def kernel(
         I=I, BLOCK_M=32, BLOCK_I=128,
     )
 
-    # ── 7. Grouped GEMM2 → [gcap, H] ─────────────────────────────────────────
+    # ── 7. Grouped GEMM2 with fused weighted scatter → out_f32 [T, H] ───────
+    # Epilogue does atomic_add(out_f32[sorted_token_ids[rm], rn], acc * w),
+    # eliminating the gemm2_out [gcap, H] fp32 buffer and a separate gather kernel.
     grid2 = lambda meta: (
         triton.cdiv(gcap, meta['BLOCK_M']) + E_LOCAL,
         triton.cdiv(H, meta['BLOCK_N']),
     )
-    _grouped_gemm2[grid2](
+    _grouped_gemm2_weighted[grid2](
         ws['swiglu_fp16'],              ws['swiglu_scale_a'],
         gemm2_weights,                  gemm2_weights_scale,
-        ws['gemm2_out'],
+        ws['sorted_token_ids'],         ws['sorted_weights'],
+        ws['out_f32'],
         ws['expert_offsets'],
         H, I, gcap,
         ws['swiglu_fp16'].stride(0),    ws['swiglu_fp16'].stride(1),
         ws['swiglu_scale_a'].stride(0), ws['swiglu_scale_a'].stride(1),
         gemm2_weights.stride(0),        gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0),  gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
-        ws['gemm2_out'].stride(0),      ws['gemm2_out'].stride(1),
+        ws['out_f32'].stride(0),        ws['out_f32'].stride(1),
     )
 
-    # ── 8. Token-parallel gather → bfloat16 output ───────────────────────────
-    # Each CTA handles one (output token, column block). Reads up to 8 gemm2_out
-    # rows via token_slot_map, multiplies by sorted_weights, writes bf16 directly.
-    # No intermediates, no atomics, coalesced writes. ~557MB → ~87MB traffic.
-    _weighted_output[(T, triton.cdiv(H, 128))](
-        ws['gemm2_out'], ws['sorted_weights'], ws['token_slot_map'],
-        output, T, H, gcap, BLOCK_N=128,
+    # ── 8. Cast fp32 accumulator → bfloat16 output ──────────────────────────
+    BM_CAST, BN_CAST = 32, 128
+    _cast_f32_to_bf16[(triton.cdiv(T, BM_CAST), triton.cdiv(H, BN_CAST))](
+        ws['out_f32'], output, T, H, BLOCK_M=BM_CAST, BLOCK_N=BN_CAST,
     )
