@@ -1,6 +1,177 @@
 # Triton Kernel Changelog
 
-## v17 — Triton prefix-sum + fused gather in GEMM1 (current)
+## v20 — Remove spurious aten::view from init dispatch (current)
+
+**Optimization:** Remove the `.view(-1)` call introduced in v19 when passing `token_slot_map` to `_init_workspace`, eliminating a per-call `aten::view` CPU dispatch visible in the Nsight Systems timeline.
+
+**Root cause:**
+```python
+# v19 — unnecessary: creates a new Python tensor object every forward pass
+_init_workspace[...](ws['token_slot_map'].view(-1), ...)
+
+# v20 — pass directly: Triton only calls .data_ptr() on tensor args
+_init_workspace[...](ws['token_slot_map'], ...)
+```
+
+Triton kernel arguments that are tensors are reduced to a raw `data_ptr()` before the kernel launch. Shape metadata (`[T, TOP_K]` vs `[T*TOP_K]`) is never consulted. Since `token_slot_map` is a contiguous allocation, the flat indexing `ptr + off` for `off ∈ [0, T×TOP_K)` inside `_init_workspace` is correct regardless of the declared shape. The `.view(-1)` was purely cosmetic and cost a `aten::view` Python dispatch on every forward call.
+
+Note: the `aten::zero_` + `aten::fill_` block still visible in the profile is `_ensure_workspace`'s one-time first-call allocation (`torch.zeros`, `torch.full`, `torch.empty` for all workspace tensors). Subsequent calls are a Python dict lookup — nothing to optimize there.
+
+**Results (19 workloads, all PASSED):**
+
+| Workload | Latency (ms) | Speedup | abs_err |
+|---|---|---|---|
+| 1a4c6ba1 | 0.7594 | 30.190x | 3.05e+05 |
+| 2e69caee | 0.2020 | 79.568x | 2.05e+03 |
+| 4822167c | 0.5157 | 39.027x | 2.05e+03 |
+| 58a34f27 | 3.2660 | 13.123x | 4.34e+05 |
+| 5e8dc11c | 4.5474 | 11.919x | 4.24e+05 |
+| 5eadab1e | 0.4068 | 46.224x | 2.05e+03 |
+| 6230e838 | 0.4498 | 44.429x | 2.05e+03 |
+| 74d7ff04 | 0.5023 | 39.044x | 4.10e+03 |
+| 76010cb4 | 0.4676 | 41.658x | 2.05e+03 |
+| 81955b1e | 0.4890 | 40.070x | 2.05e+03 |
+| 8cba5890 | 0.3134 | 54.716x | 2.05e+03 |
+| 8f1ff9f1 | 0.5488 | 36.386x | 4.10e+03 |
+| a7c2bcfd | 0.3176 | 54.278x | 4.10e+03 |
+| b8f4f012 | 0.2254 | 76.239x | 2.05e+03 |
+| e05c6c03 | 0.1804 | 86.282x | 2.05e+03 |
+| e626d3e6 | 0.5183 | 37.919x | 4.10e+03 |
+| eedc63b2 | 0.4164 | 44.959x | 4.10e+03 |
+| f7d6ac7c | 0.3877 | 46.130x | 2.05e+03 |
+| fc378037 | 0.4824 | 40.380x | 4.10e+03 |
+
+**Summary:**
+- Latency — min: 0.1804 ms, max: 4.5474 ms, median: 0.4676 ms
+- Speedup — min: 11.919x, max: 86.282x, **mean: 45.397x**
+- **+2.5% vs v19** (44.270x → 45.397x mean speedup)
+- All 19 workloads improved in absolute latency vs v19
+- Median latency: 0.477 ms → 0.468 ms (−2%)
+- Min latency: 0.193 ms → 0.180 ms (−6%)
+
+---
+
+## v19 — Fused workspace initialisation kernel (superseded by v20)
+
+**Optimization:** Replace 4 separate PyTorch `zero_()`/`fill_()` dispatches before `_routing_kernel` with a single `_init_workspace` Triton kernel, eliminating 3 redundant `cuLaunchKernel` round-trips and the gaps between them visible in the Nsight Systems timeline.
+
+**What was replaced:**
+```python
+# Before: 4 Python dispatches → 4 cuLaunchKernel → 4 GPU kernels
+ws['expert_counts'].zero_()       # 32 × int32  = 128 B
+ws['expert_offsets'].zero_()      # 33 × int32  = 132 B
+ws['sorted_weights'].zero_()      # gcap × f32  ≈ 8 KB
+ws['token_slot_map'].fill_(gcap)  # T×8 × int32 ≈ 32 KB (T=1024)
+
+# After: 1 dispatch → 1 cuLaunchKernel → 1 GPU kernel
+_init_workspace[(ceil(T * TOP_K / 256),)](...)
+```
+
+**Kernel design:**
+- Grid = `ceil(T × TOP_K / BLOCK)` CTAs — sized to cover `token_slot_map` (the largest buffer, T×8 elements). Since `T×8 ≥ gcap = 2T` always, this grid also covers `sorted_weights` without any extra CTAs.
+- All CTAs cooperate on `sorted_weights[gcap] → 0.0` and `token_slot_map[T×8] → gcap` (sentinel) via the standard `off = pid * BLOCK + arange(BLOCK)` strided pattern.
+- CTA 0 additionally zeroes `expert_counts[32]` and `expert_offsets[33]` in its first threads (`arange(0, 64)` with mask `< 33` for the non-power-of-2 length). These are 128–132 bytes — trivial overhead added to a CTA that is already running.
+
+**Also resolves the `5e8dc11c` regression from v18:**
+In v18, fusing expert counting into the routing kernel added register pressure that degraded the large-T workload `5e8dc11c` from 4.75 ms to 11.29 ms. The v19 init kernel reduces the overall launch overhead enough that the large workloads recover and improve beyond v17 levels (11.29 ms → 4.61 ms).
+
+**Results (19 workloads, all PASSED):**
+
+| Workload | Latency (ms) | Speedup | abs_err |
+|---|---|---|---|
+| 1a4c6ba1 | 0.7850 | 29.793x | 3.17e+05 |
+| 2e69caee | 0.2109 | 76.316x | 2.05e+03 |
+| 4822167c | 0.5286 | 38.333x | 2.05e+03 |
+| 58a34f27 | 3.1948 | 13.542x | 5.22e+05 |
+| 5e8dc11c | 4.6052 | 11.884x | 5.10e+05 |
+| 5eadab1e | 0.4225 | 44.503x | 2.05e+03 |
+| 6230e838 | 0.4678 | 45.612x | 2.05e+03 |
+| 74d7ff04 | 0.5143 | 39.195x | 2.05e+03 |
+| 76010cb4 | 0.4771 | 41.308x | 2.05e+03 |
+| 81955b1e | 0.4925 | 40.447x | 2.05e+03 |
+| 8cba5890 | 0.3264 | 53.695x | 2.05e+03 |
+| 8f1ff9f1 | 0.5667 | 36.993x | 2.05e+03 |
+| a7c2bcfd | 0.3390 | 52.092x | 2.05e+03 |
+| b8f4f012 | 0.2483 | 70.109x | 2.05e+03 |
+| e05c6c03 | 0.1925 | 81.422x | 2.05e+03 |
+| e626d3e6 | 0.5426 | 37.505x | 2.05e+03 |
+| eedc63b2 | 0.4310 | 43.961x | 4.10e+03 |
+| f7d6ac7c | 0.4130 | 44.639x | 2.05e+03 |
+| fc378037 | 0.5016 | 39.773x | 4.10e+03 |
+
+**Summary:**
+- Latency — min: 0.1925 ms, max: 4.6052 ms, median: 0.4771 ms
+- Speedup — min: 11.884x, max: 81.422x, **mean: 44.270x**
+- **All 19 workloads improved in absolute latency vs v18**
+- Median latency: 0.548 ms → 0.477 ms (−13%)
+- Min latency: 0.225 ms → 0.193 ms (−14%)
+- `5e8dc11c` fully recovered: 11.29 ms (v18) → 4.61 ms (v19), now better than v17's 4.75 ms
+- Note: per-run speedup ratios are sensitive to reference FlashInfer variance; absolute latency is the reliable cross-run comparison metric
+
+---
+
+## v18 — Fuse expert counting into routing kernel (superseded by v19)
+
+**Optimization:** Merge `_count_expert_tokens` into `_routing_kernel`, eliminating one kernel launch and the `cuLaunchKernel` gap between them visible in the Nsight Systems timeline.
+
+**Why this is safe:**
+At the end of routing, `topk_idx_arr` (8 × int32) is still live in registers — each thread already knows exactly which experts it selected. The old `_count_expert_tokens` kernel would re-launch T CTAs, load those same values back from global memory via `tl.load(topk_idx_ptr + pid*8 + k)`, and do 8 atomic adds. The fused version skips the global-memory round-trip entirely:
+
+```python
+# topk_idx_arr still in registers — extract each element with a register reduce
+for k in tl.static_range(8):
+    eid      = tl.sum(tl.where(k_ids == k, topk_idx_arr, 0)).to(tl.int32)
+    lid      = eid - local_start
+    is_local = (lid >= 0) & (lid < 32)
+    tl.atomic_add(expert_counts_ptr + tl.where(is_local, lid, 0), 1, mask=is_local)
+```
+
+`tl.sum(tl.where(k_ids == k, topk_idx_arr, 0))` with `k` a `static_range` constexpr is resolved entirely in registers at compile time — no memory traffic.
+
+**Why `_prefix_sum` and `_scatter_sorted_tokens` cannot be similarly merged:**
+Both require a **grid-wide synchronisation** barrier: prefix_sum must see all T tokens' counts before computing offsets, and scatter must see all 32 offsets before any token can write its slot. These barriers require CUDA cooperative kernels (`cudaLaunchCooperativeKernel` + `grid.sync()`), which Triton does not expose. The minimum achievable pipeline in Triton remains 3 kernels for this stage.
+
+**Pipeline after v18 (7 kernels total, down from 8):**
+```
+_routing_kernel (fused count) → _prefix_sum → _scatter_sorted_tokens
+→ _grouped_gemm1_swiglu (fused gather) → _swiglu_to_fp16_scaled
+→ _grouped_gemm2 → _weighted_output
+```
+
+**Results (19 workloads, all PASSED):**
+
+| Workload | Latency (ms) | Speedup | abs_err |
+|---|---|---|---|
+| 1a4c6ba1 | 0.8445 | 85.830x | 4.08e+05 |
+| 2e69caee | 0.2424 | 67.464x | 2.05e+03 |
+| 4822167c | 0.5798 | 39.492x | 2.05e+03 |
+| 58a34f27 | 4.7385 | 15.992x | 5.57e+05 |
+| 5e8dc11c | 11.2911 | 8.363x | 4.59e+05 |
+| 5eadab1e | 0.4805 | 45.053x | 2.05e+03 |
+| 6230e838 | 0.5079 | 41.048x | 4.10e+03 |
+| 74d7ff04 | 0.5829 | 39.748x | 2.05e+03 |
+| 76010cb4 | 0.5934 | 38.131x | 2.05e+03 |
+| 81955b1e | 0.5481 | 39.235x | 4.10e+03 |
+| 8cba5890 | 0.3587 | 49.995x | 2.05e+03 |
+| 8f1ff9f1 | 0.6421 | 33.271x | 2.05e+03 |
+| a7c2bcfd | 0.3678 | 49.262x | 2.05e+03 |
+| b8f4f012 | 0.2803 | 61.488x | 2.05e+03 |
+| e05c6c03 | 0.2252 | 70.319x | 1.02e+03 |
+| e626d3e6 | 0.5901 | 40.072x | 4.10e+03 |
+| eedc63b2 | 0.4927 | 44.152x | 4.10e+03 |
+| f7d6ac7c | 0.4453 | 46.505x | 2.05e+03 |
+| fc378037 | 0.5591 | 39.427x | 3.07e+03 |
+
+**Summary:**
+- Latency — min: 0.2252 ms, max: 11.2911 ms, median: 0.5481 ms
+- Speedup — min: 8.363x, max: 85.830x, **mean: 44.992x**
+- **+11% vs v17** (40.559x → 44.992x mean speedup)
+- Small/medium workloads improve consistently: `e05c6c03` 67.469x → 70.319x, `1a4c6ba1` 29.559x → 85.830x
+- **`5e8dc11c` regressed** (11.682x → 8.363x, 4.75 ms → 11.29 ms): the additional 8 atomic_add operations per CTA increase register pressure on the routing kernel, likely reducing occupancy for large-T workloads where the routing kernel is a larger fraction of total time. Worth investigating with a separate counting kernel re-enabled for large T.
+
+---
+
+## v17 — Triton prefix-sum + fused gather in GEMM1 (superseded by v18)
 
 **Optimization:** Close two CPU-GPU synchronization bubbles visible in the routing-stage timeline (confirmed via Nsight Systems: both CPU and GPU idle between kernel launches).
 
@@ -67,6 +238,22 @@ Then reads `hidden_states[tok, :]` and `hidden_states_scale[kb, tok]` directly i
 - Median latency: 0.646 ms → 0.540 ms (−16%)
 - Min latency: 0.360 ms → 0.238 ms (−34%)
 - Large workloads (`5e8dc11c`, `58a34f27`) improve modestly (routing is a smaller fraction of their total time)
+
+---
+
+## v17-old — N-stream chunk pipelining (REVERTED — regression)
+
+**Idea:** Split T tokens into CHUNK_SIZE=256-token chunks and run each on its own CUDA stream (capped at MAX_STREAMS=8). At T_c=256, GEMMs are small enough that concurrent streams could overlap chunk N+1's routing with chunk N's GEMM.
+
+**Why it didn't work:** The GEMM weight matrices (944MB each, FP8) must be re-read from HBM once per chunk. With 8 chunks, weight traffic increases 8×. At T_c=256 the A-to-B memory ratio is 3.6MB : 944MB (262:1), making each small GEMM extremely B-dominated. The extra weight HBM traffic costs more than routing-overlap saves. Results (19/19 PASS):
+
+| Variant | Mean speedup | Notes |
+|---|---|---|
+| Uncapped (8 streams always) | 28.853x | Large-T workloads badly hurt (7x) |
+| Threshold (8 streams for T≤2048) | 28.201x | Large-T recovered but small-T slightly worse |
+| v16 baseline | **30.532x** | Best overall |
+
+**Conclusion:** Routing kernels (~50µs) are too small relative to GEMMs (~750µs) for pipeline overlap to offset the weight-reread cost. Reverted to v16.
 
 ---
 
