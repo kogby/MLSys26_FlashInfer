@@ -1,16 +1,17 @@
 """
-Triton FP8 Fused MoE kernel — v18
+Triton FP8 Fused MoE kernel — v21
 
-v18 fuses the weighted output scatter into GEMM2's epilogue, eliminating the
+v21 fuses the weighted output scatter into GEMM2's epilogue, eliminating the
 intermediate `gemm2_out [gcap, H] fp32` workspace and the `_weighted_output`
-gather kernel.
+gather kernel.  Combined with v20's fused workspace init (retrofitted here to
+skip token_slot_map, which the fused-GEMM2 path no longer needs).
 
-Old (v17) GEMM2 + scatter:
+Old (v20) GEMM2 + scatter:
   GEMM2 epilogue:    tl.store(gemm2_out[rm, rn], acc)              # [gcap, H] fp32 write
   _weighted_output:  acc = sum_k(gemm2_out[slot_k, :] * w[slot_k]) # [gcap, H] fp32 read
                      output[t, :] = acc.to(bf16)                   # [T, H]    bf16 write
 
-New (v18) GEMM2 + scatter (fused):
+New (v21) GEMM2 + scatter (fused):
   GEMM2 epilogue:    tok = sorted_token_ids[rm]                    # original token row
                      w   = sorted_weights[rm]                      # routing weight
                      atomic_add(out_f32[tok, rn], acc * w[:, None])

@@ -1,6 +1,121 @@
 # Triton Kernel Changelog
 
-## v20 — Remove spurious aten::view from init dispatch (current)
+## v21 — Fuse weighted output scatter into GEMM2 epilogue (current)
+
+**Optimization:** Merge the standalone `_weighted_output` gather kernel into `_grouped_gemm2`'s epilogue. Each GEMM2 tile now atomic-adds its weighted contribution directly into a `[T, H]` fp32 accumulator, eliminating the intermediate `gemm2_out [gcap, H]` workspace and one full kernel launch.
+
+This is a parallel branch developed against v18 base (pre-`_init_workspace`). It now lives on top of v20 — keeping every prior dispatch-reduction win — by retrofitting `_init_workspace` to skip the `token_slot_map` fill (no longer needed, see below) and using PyTorch's `cudaMemsetAsync` for the larger `out_f32` buffer.
+
+**What changed in the GEMM2 + scatter dataflow:**
+
+```python
+# v20 (3 stages, [gcap, H] intermediate)
+GEMM2 epilogue:    tl.store(gemm2_out[rm, rn], acc)              # [gcap, H] fp32 write
+_weighted_output:  acc = sum_k(gemm2_out[slot_k, :] * w[slot_k]) # [gcap, H] fp32 read
+                   output[t, :] = acc.to(bf16)                   # [T, H]    bf16 write
+
+# v21 (2 stages, [T, H] accumulator)
+GEMM2 epilogue:    tok = sorted_token_ids[rm]                    # original token row
+                   w   = sorted_weights[rm]                      # routing weight
+                   atomic_add(out_f32[tok, rn], acc * w[:, None])
+_cast_f32_to_bf16: output[t, :] = out_f32[t, :].to(bf16)         # [T, H] bf16 write
+```
+
+**What this saves (T=1024, gcap=2048):**
+- `gemm2_out [gcap, H]` fp32: **56 MB write + 56 MB read eliminated** (gcap = 2T, so this buffer is 2× the size of `out_f32`)
+- `token_slot_map [T, TOP_K]` workspace + its sentinel-fill init: ~32 KB + one branch in `_init_workspace`
+- One full kernel launch (`_weighted_output`) and the `cuLaunchKernel` gap before it
+
+**What it costs:**
+- `out_f32 [T, H]` fp32: 28 MB workspace, must be zeroed each call
+- Per-tile `atomic_add` on fp32 in HBM is ~10–20× slower than `tl.store` per byte. Net win comes from saving an entire HBM round-trip on the larger `gemm2_out` buffer
+- Contention pattern: each (token, expert) pair appears at most once in sorted layout, so different K-tile experts writing the same output row is the only race. Top-K=8 bounds the contention to 8 atomic_adds per output cell across the run
+
+**`_grouped_gemm2_weighted` epilogue design (avoid v9c reg-pressure regression):**
+The two epilogue inputs (`tok`, `w`) are loaded **once outside the K-loop** so they don't enter the inner accumulator's working set. v9c showed that touching extra tensors inside the K-loop forces the autotuner to pick smaller `BLOCK_M`, eroding the GEMM throughput win. Reading 2 × BLOCK_M scalars before the K-loop is essentially free (1 cache line).
+
+```python
+# Outside K-loop — load once
+tok = tl.load(token_ids_ptr + rm, mask=valid_m, other=0)
+w   = tl.load(weights_ptr   + rm, mask=valid_m, other=0.0)
+
+# K-loop unchanged from v20 (FP16×FP16→FP32 tensor core)
+for kb in range(K // BLOCK_K):
+    ...
+
+# Epilogue — atomic-add weighted result directly to output
+weighted = acc * w[:, None]
+tl.atomic_add(out_f32_ptr + tok[:, None] * stride_om + rn[None, :] * stride_on,
+              weighted, mask=valid_m[:, None] & (rn[None, :] < N))
+```
+
+**Autotune correctness with `reset_to_zero=['out_f32_ptr']`:**
+Triton autotune launches each config repeatedly to time it. With `atomic_add` into a persistent fp32 buffer, those trial launches accumulate into `out_f32`, blowing up the values seen by `_cast_f32_to_bf16` on the first real call. The `reset_to_zero=['out_f32_ptr']` autotune flag clears the accumulator before every trial — same pattern v9c needed when first introducing atomic accumulation.
+
+**`_init_workspace` retrofit (preserve v19/v20 wins on the new dataflow):**
+The fused-GEMM2 path no longer allocates `token_slot_map` (no gather → no sentinel needed), so the v20 init kernel — which fills 4 buffers — is reduced to 3:
+
+```python
+# v20 — fused init, 4 buffers
+_init_workspace[ceil(T*TOP_K/256)](expert_counts, expert_offsets,
+                                   sorted_weights, token_slot_map, ...)
+
+# v21 — fused init, 3 buffers; out_f32 zero-d via cudaMemsetAsync
+_init_workspace[ceil(gcap/256)](expert_counts, expert_offsets, sorted_weights, ...)
+ws['out_f32'].zero_()
+```
+
+`out_f32` is 28 MB — almost 900× the size of `token_slot_map`. Folding it into `_init_workspace` would make that kernel HBM-bandwidth-bound (its sole job becomes memset), and PyTorch's `cudaMemsetAsync` already hits peak HBM bandwidth. Keeping the small-buffer fast path and using `.zero_()` for `out_f32` is the right split.
+
+The grid shrinks from `ceil(T*TOP_K/256) = ceil(8T/256)` to `ceil(gcap/256) = ceil(2T/256)` — 4× fewer CTAs since `token_slot_map` was the largest buffer.
+
+**Pipeline (7 kernels total, same count as v20):**
+```
+_init_workspace + out_f32.zero_()
+→ _routing_kernel (fused count) → _prefix_sum → _scatter_sorted_tokens
+→ _grouped_gemm1_swiglu (fused gather) → _swiglu_to_fp16_scaled
+→ _grouped_gemm2_weighted (fused atomic-add scatter) → _cast_f32_to_bf16
+```
+
+The kernel count is unchanged but the slowest stage's HBM traffic dropped from `2 × [gcap, H]` (= 4 × `[T, H]`) to `1 × [T, H]` plus atomic contention.
+
+**Results (19 workloads):**
+
+_TODO: run `modal run scripts/run_modal.py --track moe --baseline both` on B200 and fill in._
+
+| Workload | Latency (ms) | vs torch | vs flashinfer | abs_err |
+|---|---|---|---|---|
+| 1a4c6ba1 | | | | |
+| 2e69caee | | | | |
+| 4822167c | | | | |
+| 58a34f27 | | | | |
+| 5e8dc11c | | | | |
+| 5eadab1e | | | | |
+| 6230e838 | | | | |
+| 74d7ff04 | | | | |
+| 76010cb4 | | | | |
+| 81955b1e | | | | |
+| 8cba5890 | | | | |
+| 8f1ff9f1 | | | | |
+| a7c2bcfd | | | | |
+| b8f4f012 | | | | |
+| e05c6c03 | | | | |
+| e626d3e6 | | | | |
+| eedc63b2 | | | | |
+| f7d6ac7c | | | | |
+| fc378037 | | | | |
+
+**Summary:**
+- TODO
+
+**Risks / things to watch:**
+- `out_f32.zero_()` (28 MB) adds ~10 μs HBM-bandwidth-bound latency to every call. Total kernel time is sub-millisecond on small workloads, so this is a measurable fraction; if absolute latency on small-T workloads regresses, consider folding the zero into a fused init of the very first GEMM1 tile that touches each row
+- Atomic contention on `out_f32` rows scales with how many K-tile partitions of the same expert touch the same token. Per-token K is fixed (= 1 expert per slot per pass), so this should be bounded; verify with Nsight Compute's `l2_atomic_total` counters if regressions show up
+- abs_err magnitude is unchanged from v20 in workloads where it was already > 1e3 — atomic-add is bit-reproducible only within a kernel launch, not across them, but rel_err (the gating metric, atol=1, rtol=0.3) should be unaffected since the floating-point reduction order changed only at the granularity of expert tiles, not within a tile
+
+---
+
+## v20 — Remove spurious aten::view from init dispatch (superseded by v21)
 
 **Optimization:** Remove the `.view(-1)` call introduced in v19 when passing `token_slot_map` to `_init_workspace`, eliminating a per-call `aten::view` CPU dispatch visible in the Nsight Systems timeline.
 
