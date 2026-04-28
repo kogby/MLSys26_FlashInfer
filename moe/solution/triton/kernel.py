@@ -6,8 +6,10 @@ Pipeline (all GPU, no CPU sync):
   1. _routing_kernel         — [T,8] expert indices + weights + fused expert counting
   2. _prefix_sum             — expert_offsets [E_LOCAL+1] + write_ptrs (1 CTA, registers)
   3. _scatter_sorted_tokens  — sorted_token_ids, sorted_weights
-  4. _grouped_gemm1_swiglu   — FP8×FP8→fp32 with inline token gather + SwiGLU epilogue
-  5. _swiglu_to_fp16_scaled  — silu(up)*gate fp32; per-row × per-128-K-block FP16 quant
+  4. _grouped_gemm1_swiglu   — FP8×FP8→fp32 with inline token gather (note: SwiGLU
+                                is NOT fused; the kernel name is historical — see step 5)
+  5. _swiglu_to_fp16_scaled  — silu(up)*gate on fp32 GEMM1 output; per-row × per-128-K
+                                FP16 quantization for GEMM2
   6. _grouped_gemm2_weighted — FP16×FP16→fp32, atomic-add weighted into out_f32
   7. _cast_f32_to_bf16       — out_f32 [T,H] → output [T,H] bf16
 

@@ -31,7 +31,7 @@ def kernel(...):
 
 **Known cost:** capture (one full forward + graph build, ~1–5 ms) is paid 5× per workload (once per trial) but amortized over 99 replays each. Net well above breakeven for 100-iter trials.
 
-**Results (19 workloads, all PASSED on B200):**
+**Results (19 workloads, all PASSED on H100):**
 
 | Workload | Latency (ms) | vs torch | abs_err |
 |---|---|---|---|
@@ -59,7 +59,8 @@ def kernel(...):
 
 - Latency — min: 0.0965 ms, max: 4.9819 ms, median: 0.3864 ms
 - vs torch — min: 10.975x, max: 161.310x, **mean: 61.436x**
-- **+33% vs v21** (46.231x → 61.436x mean speedup) — measured on the same B200 run, same `--baseline torch` configuration
+- vs torch (B200) - min: 11.564x  max: 139.292x  mean: 70.616x
+- **+33% vs v21** (46.231x → 61.436x mean speedup) — measured on the same H100 run, same `--baseline torch` configuration
 - vs flashinfer baseline: not measured this run (`--baseline torch` only); rerun with `--baseline both` to record the official scoring metric
 
 **Where the win comes from (relative to v21):** the ~95 µs of inter-kernel host-launch idle observed in nsys (between `_init_workspace` / `_routing_kernel` / `_prefix_sum` / `_scatter_sorted_tokens`) collapses to a single `cudaGraphLaunch`. The per-workload speedup correlates inversely with absolute latency, exactly as predicted:
@@ -155,7 +156,7 @@ _init_workspace + out_f32.zero_()
 
 The kernel count is unchanged but the slowest stage's HBM traffic dropped from `2 × [gcap, H]` (= 4 × `[T, H]`) to `1 × [T, H]` plus atomic contention.
 
-**Results (19 workloads, all PASSED on B200):**
+**Results (19 workloads, all PASSED on H100):**
 
 | Workload | Latency (ms) | vs torch | abs_err |
 |---|---|---|---|
