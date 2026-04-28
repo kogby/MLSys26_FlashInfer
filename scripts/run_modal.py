@@ -53,6 +53,8 @@ Options:
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -100,6 +102,7 @@ image = (
 def pack_and_run(
     sources: dict,
     config: dict,
+    version_info: dict,
     max_workloads: int = None,
     debug: bool = False,
     profile: bool = False,
@@ -120,6 +123,18 @@ def pack_and_run(
 
     from flashinfer_bench import Benchmark, BenchmarkConfig, BuildSpec, TraceSet
     from flashinfer_bench.agents import pack_solution_from_files
+
+    # ── Print run identity banner so logs make it obvious which version ran ─
+    track = config["solution"].get("definition", "?")
+    kver = version_info.get("kernel_version", "unknown")
+    branch = version_info.get("branch", "unknown")
+    commit = version_info.get("commit", "unknown")
+    dirty = " (dirty)" if version_info.get("dirty") else ""
+    print("=" * 70)
+    print(f"  Kernel version : {kver}")
+    print(f"  Definition     : {track}")
+    print(f"  Git            : {branch}@{commit}{dirty}")
+    print("=" * 70)
 
     os.environ["FIB_DEBUG"] = "1" if debug else "0"
     os.environ["FIB_PROFILE"] = "1" if profile else "0"
@@ -249,6 +264,48 @@ def pack_and_run(
     print_results(results, baseline=baseline)
 
     return results
+
+
+def _extract_kernel_version(sources: dict, entry_point: str) -> str:
+    """Extract version string from the entry-point file's leading docstring.
+
+    Matches `<anything> — v<digits><suffix>` on the first non-blank line of
+    the docstring (e.g. `Triton FP8 Fused MoE kernel — v22`).  Returns
+    "unknown" if no match.  This lets the version follow whatever the kernel
+    author wrote in the docstring without any separate config to maintain.
+    """
+    entry_file = entry_point.split("::")[0]
+    src = sources.get(entry_file)
+    if src is None:
+        return "unknown"
+    # Look at first ~10 lines (docstring header) for "— vNN" pattern.
+    for line in src.splitlines()[:10]:
+        # em dash or hyphen, then 'v' + digits, optional suffix.
+        m = re.search(r"[—\-]\s*(v\d+\w*)", line)
+        if m:
+            return m.group(1)
+    return "unknown"
+
+
+def _git_info() -> dict:
+    """Capture git branch, short commit hash, and dirty state of the repo.
+
+    Returns a dict with keys 'branch', 'commit', 'dirty' (and 'error' on
+    failure).  Best-effort — never raises, so a missing git binary or a
+    non-repo checkout just degrades to 'unknown'.
+    """
+    def _git(args: list[str]) -> str:
+        return subprocess.check_output(
+            ["git", *args], cwd=PROJECT_ROOT, stderr=subprocess.DEVNULL
+        ).decode().strip()
+
+    try:
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+        commit = _git(["rev-parse", "--short", "HEAD"])
+        dirty = bool(_git(["status", "--porcelain"]))
+        return {"branch": branch, "commit": commit, "dirty": dirty}
+    except Exception as e:
+        return {"branch": "unknown", "commit": "unknown", "dirty": False, "error": str(e)}
 
 
 def _discover_tracks() -> list[str]:
@@ -391,6 +448,11 @@ def main(
 
     print(f"Loading sources for track '{track}'...")
     sources, config = _load_track_sources(track)
+    kernel_version = _extract_kernel_version(sources, config["build"]["entry_point"])
+    git = _git_info()
+    version_info = {"kernel_version": kernel_version, **git}
+    dirty = " (dirty)" if git.get("dirty") else ""
+    print(f"Kernel version: {kernel_version}  |  git: {git['branch']}@{git['commit']}{dirty}")
     print(f"Sending {len(sources)} file(s) to Modal: {list(sources.keys())}")
     print(f"Running on Modal {MODAL_GPU} (baseline={baseline})...")
 
@@ -398,6 +460,7 @@ def main(
     results = pack_and_run.remote(
         sources,
         config,
+        version_info,
         max_workloads=workload_limit,
         debug=debug,
         profile=profile,
