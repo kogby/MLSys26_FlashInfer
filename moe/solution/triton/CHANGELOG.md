@@ -1,5 +1,75 @@
 # Triton Kernel Changelog
 
+## v17 — Triton prefix-sum + fused gather in GEMM1 (current)
+
+**Optimization:** Close two CPU-GPU synchronization bubbles visible in the routing-stage timeline (confirmed via Nsight Systems: both CPU and GPU idle between kernel launches).
+
+**Gap 1 — after `_count_expert_tokens`, before `_scatter_sorted_tokens`:**
+
+The old step 3 was:
+```python
+ws['expert_offsets'][1:] = ws['expert_counts'].cumsum(0).to(torch.int32)
+ws['write_ptrs'].copy_(ws['expert_offsets'][:-1])
+```
+Three PyTorch dispatch round-trips (`aten::cumsum` → `aten::to` → `aten::copy_`) for only 32 elements each. Every call goes through the Python interpreter → CUDA command queue → kernel launch overhead, stalling the dispatch pipeline.
+
+**Fix:** New `_prefix_sum[(1,)]` Triton kernel. Single CTA, one warp: loads 32 counts, runs `tl.cumsum` entirely in registers, writes both `expert_offsets[1:]` and `write_ptrs` in one shot. `offsets[0] = 0` is already satisfied by the `expert_offsets.zero_()` call earlier in the frame. Three dispatches → one.
+
+**Gap 2 — after `_scatter_sorted_tokens`, before `_grouped_gemm1_swiglu`:**
+
+The old step 5 was:
+```python
+sorted_A       = hidden_states[ws['sorted_token_ids']].contiguous()
+sorted_A_scale = hidden_states_scale[:, ws['sorted_token_ids']].contiguous()
+```
+Two `aten::index` fancy-gather kernels allocating `[gcap, H]` (FP8) and `[H//128, gcap]` (FP32) tensors. For T=1024: `sorted_A` ≈ 7 MB, `sorted_A_scale` ≈ 224 KB, plus the CUDA kernel launch and synchronization overhead.
+
+**Fix:** `_grouped_gemm1_swiglu` gains a new first argument `token_ids_ptr` (`sorted_token_ids`). Each CTA loads its token indices once before the K-loop:
+```python
+tok = tl.load(token_ids_ptr + rm, mask=rm_local < M_e, other=0)
+```
+Then reads `hidden_states[tok, :]` and `hidden_states_scale[kb, tok]` directly inside the K-loop. The two `aten::index` + `.contiguous()` calls — and the intermediate allocations — are eliminated entirely. Strides passed to GEMM1 now come from the raw `hidden_states` and `hidden_states_scale` tensors (`stride_am = H`, `stride_sA_kb = T`).
+
+**Memory saved per call (T=1024, gcap=2048):**
+| Eliminated tensor | Size |
+|---|---|
+| `sorted_A` `[gcap=2048, H=7168]` FP8 | ~7 MB |
+| `sorted_A_scale` `[H//128=56, gcap=2048]` FP32 | ~448 KB |
+
+**Results (19 workloads, all PASSED):**
+
+| Workload | Latency (ms) | Speedup | abs_err |
+|---|---|---|---|
+| 1a4c6ba1 | 0.8403 | 29.559x | 3.73e+05 |
+| 2e69caee | 0.2623 | 63.230x | 4.10e+03 |
+| 4822167c | 0.5943 | 36.745x | 2.05e+03 |
+| 58a34f27 | 3.3192 | 13.259x | 5.06e+05 |
+| 5e8dc11c | 4.7463 | 11.682x | 5.90e+05 |
+| 5eadab1e | 0.4762 | 41.612x | 4.10e+03 |
+| 6230e838 | 0.5220 | 40.054x | 2.05e+03 |
+| 74d7ff04 | 0.5848 | 36.767x | 4.10e+03 |
+| 76010cb4 | 0.5398 | 39.056x | 4.10e+03 |
+| 81955b1e | 0.5569 | 38.310x | 4.10e+03 |
+| 8cba5890 | 0.3717 | 49.283x | 2.05e+03 |
+| 8f1ff9f1 | 0.6233 | 35.767x | 4.10e+03 |
+| a7c2bcfd | 0.3853 | 48.119x | 2.05e+03 |
+| b8f4f012 | 0.2813 | 61.373x | 2.05e+03 |
+| e05c6c03 | 0.2381 | 67.469x | 2.05e+03 |
+| e626d3e6 | 0.5984 | 36.337x | 2.05e+03 |
+| eedc63b2 | 0.4867 | 41.153x | 2.05e+03 |
+| f7d6ac7c | 0.4625 | 42.286x | 4.10e+03 |
+| fc378037 | 0.5534 | 38.552x | 4.10e+03 |
+
+**Summary:**
+- Latency — min: 0.2381 ms, max: 4.7463 ms, median: 0.5398 ms
+- Speedup — min: 11.682x, max: 67.469x, **mean: 40.559x**
+- **+33% vs v16** (30.532x → 40.559x mean speedup)
+- Median latency: 0.646 ms → 0.540 ms (−16%)
+- Min latency: 0.360 ms → 0.238 ms (−34%)
+- Large workloads (`5e8dc11c`, `58a34f27`) improve modestly (routing is a smaller fraction of their total time)
+
+---
+
 ## v17-old — N-stream chunk pipelining (REVERTED — regression)
 
 **Idea:** Split T tokens into CHUNK_SIZE=256-token chunks and run each on its own CUDA stream (capped at MAX_STREAMS=8). At T_c=256, GEMMs are small enough that concurrent streams could overlap chunk N+1's routing with chunk N's GEMM.
@@ -16,7 +86,7 @@
 
 ---
 
-## v16 — Token-parallel gather kernel replaces index_add_ (current)
+## v16 — Token-parallel gather kernel replaces index_add_ (superseded by v17)
 
 **Optimization:** Replace the 4-op scatter path (mul + zeros + index_add_ + copy_) at the end of each forward pass with a single fused Triton gather kernel.
 
