@@ -25,6 +25,7 @@ v16 (previous):
 - Token-parallel _weighted_output gather replaces index_add_ scatter.
 
 Pipeline (all GPU, no CPU sync):
+  0. _init_workspace         — Triton; zero/fill 4 mutable buffers (1 kernel)
   1. _routing_kernel         — Triton; [T,8] indices + weights + fused counting
   2. _prefix_sum             — Triton; expert_offsets [E_LOCAL+1] + write_ptrs
   3. _scatter_sorted_tokens  — Triton; sorted_token_ids, sorted_weights,
@@ -441,6 +442,47 @@ def _routing_kernel(
 
 
 @triton.jit
+def _init_workspace(
+    expert_counts_ptr,   # [E_LOCAL=32] int32     → zero
+    expert_offsets_ptr,  # [E_LOCAL+1=33] int32   → zero
+    sorted_weights_ptr,  # [gcap] f32             → zero
+    token_slot_map_ptr,  # [T * TOP_K] int32      → gcap (sentinel)
+    gcap,                # sorted_weights length; also the sentinel fill value
+    total_slots,         # T * TOP_K  (token_slot_map flat length)
+    BLOCK: tl.constexpr,
+):
+    """Replace four separate PyTorch zero_()/fill_() dispatches with one kernel.
+
+    Grid = ceil(total_slots / BLOCK) CTAs, which always covers sorted_weights
+    too (total_slots = T*8 >= gcap = 2T for T >= 1, with equality at T=1).
+
+    CTA 0 additionally zeroes expert_counts[32] and expert_offsets[33] in its
+    first 64 threads — these tiny arrays take a negligible number of cycles but
+    previously cost a full Python dispatch + cuLaunchKernel each.
+    """
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+
+    # ── CTA 0: zero the two tiny routing arrays ───────────────────────────────
+    if pid == 0:
+        # expert_counts[32]
+        ec_idx = tl.arange(0, 32)
+        tl.store(expert_counts_ptr + ec_idx, tl.zeros((32,), dtype=tl.int32))
+        # expert_offsets[33]: use next power-of-2 (64) with a mask
+        eo_idx = tl.arange(0, 64)
+        tl.store(expert_offsets_ptr + eo_idx,
+                 tl.zeros((64,), dtype=tl.int32), mask=eo_idx < 33)
+
+    # ── All CTAs: zero sorted_weights[gcap] ──────────────────────────────────
+    tl.store(sorted_weights_ptr + off,
+             tl.zeros((BLOCK,), dtype=tl.float32), mask=off < gcap)
+
+    # ── All CTAs: fill token_slot_map[total_slots] with gcap sentinel ─────────
+    tl.store(token_slot_map_ptr + off,
+             tl.full((BLOCK,), gcap, dtype=tl.int32), mask=off < total_slots)
+
+
+@triton.jit
 def _prefix_sum(
     counts_ptr,      # [E_LOCAL] int32 — token counts per local expert
     offsets_ptr,     # [E_LOCAL+1] int32 — output: exclusive prefix (offsets[0]=0 pre-zeroed)
@@ -564,11 +606,21 @@ def kernel(
     ws = _ensure_workspace(T, device)
     gcap = ws['gcap']
 
-    # ── Re-init mutable buffers (all GPU ops, near-zero latency) ─────────────
-    ws['expert_counts'].zero_()
-    ws['expert_offsets'].zero_()
-    ws['sorted_weights'].zero_()        # KEY INVARIANT: invalid rows → 0 weight → 0 output contribution
-    ws['token_slot_map'].fill_(gcap)    # reset sentinel; scatter will overwrite local assignments
+    # ── 0. Fused workspace init (Triton, 1 kernel) ───────────────────────────
+    # Replaces 4 separate PyTorch dispatches (zero_/zero_/zero_/fill_) with a
+    # single kernel launch.  Covers the two tiny routing arrays (CTA 0) and the
+    # two large per-call buffers (all CTAs).
+    # KEY INVARIANT: sorted_weights[invalid] = 0 → gemm2_out[invalid]*0 = 0 →
+    # those slots contribute nothing to the output accumulation.
+    _INIT_BLOCK = 256
+    _init_workspace[(triton.cdiv(T * TOP_K, _INIT_BLOCK),)](
+        ws['expert_counts'],
+        ws['expert_offsets'],
+        ws['sorted_weights'],
+        ws['token_slot_map'],   # Triton uses raw .data_ptr(); shape metadata irrelevant
+        gcap, T * TOP_K,
+        BLOCK=_INIT_BLOCK,
+    )
 
     # ── 1+2. Fused routing + counting (Triton, 1 kernel) ────────────────────
     # topk_idx_arr is live in registers at the end of routing, so counting is
@@ -583,7 +635,7 @@ def kernel(
     # ── 3. Triton prefix sum (replaces aten::cumsum + aten::to + aten::copy_) ──
     # Single CTA, 32 threads — computes exclusive prefix sum in registers and
     # writes both expert_offsets[1:] and write_ptrs in one kernel launch.
-    # offsets[0] is already 0 from the expert_offsets.zero_() above.
+    # offsets[0] is already 0 from the _init_workspace call above.
     _prefix_sum[(1,)](
         ws['expert_counts'], ws['expert_offsets'], ws['write_ptrs'], E=E_LOCAL,
     )
