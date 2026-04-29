@@ -1,6 +1,41 @@
 # Triton Kernel Changelog
 
-## v22 — CUDA Graph capture/replay + fused out_f32 zero (current)
+## v23 — Revert v21 atomic-add scatter on v22 base (current)
+
+**Hypothesis:** v21's fused atomic-add scatter into `out_f32 [T, H]` improved the mean speedup by only +1.8% (45.397x → 46.231x) and **regressed the two largest workloads**:
+
+| Workload | v20 | v21 | v22 (v21 base) |
+|---|---|---|---|
+| `5e8dc11c` | 4.5474 ms | 5.0226 ms (+10%) | 4.9819 ms |
+| `58a34f27` | 3.2660 ms | 3.4008 ms (+4%) | 3.3850 ms |
+
+v22's CUDA graph benefit (+33% mean) came entirely from small workloads where host-launch overhead dominates. For large compute-bound workloads, v22 still carries v21's `atomic_add` penalty. Applying the CUDA graph directly on v20's `tl.store` + `_weighted_output` pipeline should recover large-workload performance while keeping the graph benefit for small workloads.
+
+**What changed (v21 removed, v22 CUDA graph kept):**
+
+- `_grouped_gemm2_weighted` (atomic-add epilogue) → **`_grouped_gemm2`** (plain `tl.store` to `gemm2_out [gcap, H]`)
+- `_cast_f32_to_bf16` → **`_weighted_output`** (token-parallel gather from `gemm2_out` via `token_slot_map`)
+- `_init_workspace` reverted to v20 style: fills `token_slot_map [T*8]` with `gcap` sentinel; grid sized by `T*TOP_K` (not `T*H`)
+- `_scatter_sorted_tokens` restored: writes `token_slot_map[pid*8+k] = pos` for local experts
+- Workspace: `out_f32 [T, H]` removed; `gemm2_out [gcap, H]` + `token_slot_map [T, TOP_K]` restored
+- `kernel()` CUDA graph wrapper: **unchanged**
+
+**Pipeline (8 kernels, same count as v20):**
+```
+_init_workspace (zero routing arrays + sorted_weights; fill token_slot_map sentinel)
+→ _routing_kernel (fused count) → _prefix_sum → _scatter_sorted_tokens (fills token_slot_map)
+→ _grouped_gemm1_swiglu (fused gather) → _swiglu_to_fp16_scaled
+→ _grouped_gemm2 (plain store → gemm2_out) → _weighted_output (gather → bf16 output)
+```
+All wrapped in CUDA Graph capture/replay (v22).
+
+**Expected outcome:** Large workloads recover to v20 levels (~4.5 ms for `5e8dc11c`). Small workloads retain the CUDA graph benefit. Mean speedup should exceed v22's 61.436x.
+
+**Results:** _pending benchmark run_
+
+---
+
+## v22 — CUDA Graph capture/replay + fused out_f32 zero (superseded by v23)
 
 **Problem (observed in nsys):** Between the four short kernels at the start of the pipeline (`_init_workspace`, `_routing_kernel`, `_prefix_sum`, `_scatter_sorted_tokens`), GPU is idle for ~95 µs total per forward. Each idle period is *kernel-runtime ≈ launch-to-execute latency* — the small grids (1 CTA for `_prefix_sum`, T CTAs for `_scatter`) finish faster than CUDA's front-end can resolve the next launch's resources, so the launch-pipeline overhead becomes visible. GEMM1/GEMM2 don't show the same gap because their multi-hundred-µs runtime hides the front-end overhead of whatever follows.
 

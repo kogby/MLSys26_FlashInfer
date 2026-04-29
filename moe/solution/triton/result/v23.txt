@@ -1,0 +1,26 @@
+Workload     Status         Latency (ms)   vs torch     vs flashinfer    abs_err
+---------------------------------------------------------------------------------
+1a4c6ba1     PASSED         0.5771         36.175x      N/A              3.89e+05
+2e69caee     PASSED         0.1065         113.081x     N/A              2.05e+03
+4822167c     PASSED         0.2510         68.448x      N/A              2.05e+03
+58a34f27     PASSED         2.9444         12.480x      N/A              5.41e+05
+5e8dc11c     PASSED         4.1082         11.344x      N/A              6.06e+05
+5eadab1e     PASSED         0.2199         67.525x      N/A              4.10e+03
+6230e838     PASSED         0.2255         68.562x      N/A              4.10e+03
+74d7ff04     PASSED         0.2477         65.280x      N/A              2.05e+03
+76010cb4     PASSED         0.2285         68.736x      N/A              4.10e+03
+81955b1e     PASSED         0.2410         67.878x      N/A              2.05e+03
+8cba5890     PASSED         0.1428         94.791x      N/A              2.05e+03
+8f1ff9f1     PASSED         0.2861         59.815x      N/A              2.05e+03
+a7c2bcfd     PASSED         0.1496         91.000x      N/A              4.10e+03
+b8f4f012     PASSED         0.1085         118.880x     N/A              2.05e+03
+e05c6c03     PASSED         0.0947         122.932x     N/A              2.05e+03
+e626d3e6     PASSED         0.2540         64.956x      N/A              4.10e+03
+eedc63b2     PASSED         0.2193         67.916x      N/A              2.05e+03
+f7d6ac7c     PASSED         0.2099         69.014x      N/A              2.05e+03
+fc378037     PASSED         0.2413         66.189x      N/A              4.10e+03
+
+Summary (19 workloads):
+  Latency (run on B200) — min: 0.0947 ms  max: 4.1082 ms  median: 0.2285 ms
+  Speedup (vs. PyTorch) — min: 11.344x  max: 122.932x  mean: 70.263x
+  Speedup (vs. FI-baseline) — min: 0.513x  max: 2.732x  mean: 1.318x
