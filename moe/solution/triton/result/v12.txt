@@ -21,5 +21,5 @@ f7d6ac7c     PASSED         0.5501           23.397x      4.10e+03
 fc378037     PASSED         0.6688           21.290x      4.10e+03
 
 Summary (19 workloads):
-  Latency — min: 0.2943 ms  max: 8.1334 ms  median: 0.6312 ms
-  Speedup — min: 5.493x  max: 36.636x  mean: 22.751x
+  Latency (run on B200) — min: 0.2943 ms  max: 8.1334 ms  median: 0.6312 ms
+  Speedup (vs. PyTorch) — min: 5.493x  max: 36.636x  mean: 22.751x
