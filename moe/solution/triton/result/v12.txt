@@ -23,4 +23,4 @@ fc378037     PASSED         0.6688           21.290x      4.10e+03
 Summary (19 workloads):
   Latency (run on B200) — min: 0.2943 ms  max: 8.1334 ms  median: 0.6312 ms
   Speedup (vs. PyTorch) — min: 5.493x  max: 36.636x  mean: 22.751x
-  Speedup (vs. FI-baseline) — min: 0.258x  max: 0.770x  mean: 0.430x
+  Speedup (vs. FI-baseline) — min: 0.259x  max: 0.879x  mean: 0.475x
