@@ -1,0 +1,25 @@
+Workload     Status         Latency (ms)     Speedup      abs_err
+------------------------------------------------------------------------
+1a4c6ba1     PASSED         1.0943           17.793x      4.77e+05
+2e69caee     PASSED         0.3109           35.648x      4.10e+03
+4822167c     PASSED         0.6509           22.060x      2.05e+03
+58a34f27     PASSED         4.6612           7.496x       5.22e+05
+5e8dc11c     PASSED         6.9544           6.406x       4.98e+05
+5eadab1e     PASSED         0.5560           23.818x      4.10e+03
+6230e838     PASSED         0.6467           20.724x      4.10e+03
+74d7ff04     PASSED         0.6533           21.986x      4.10e+03
+76010cb4     PASSED         0.6422           21.366x      4.10e+03
+81955b1e     PASSED         0.6409           21.798x      4.10e+03
+8cba5890     PASSED         0.4532           26.076x      4.10e+03
+8f1ff9f1     PASSED         0.7427           20.974x      4.10e+03
+a7c2bcfd     PASSED         0.4602           26.325x      4.10e+03
+b8f4f012     PASSED         0.3497           32.094x      4.10e+03
+e05c6c03     PASSED         0.2925           36.598x      2.05e+03
+e626d3e6     PASSED         0.6908           21.558x      4.10e+03
+eedc63b2     PASSED         0.5866           22.379x      4.10e+03
+f7d6ac7c     PASSED         0.5411           23.406x      2.05e+03
+fc378037     PASSED         0.6375           22.005x      4.10e+03
+
+Summary (19 workloads):
+  Latency — min: 0.2925 ms  max: 6.9544 ms  median: 0.6409 ms
+  Speedup — min: 6.406x  max: 36.598x  mean: 22.658x

@@ -1,25 +1,25 @@
 Workload     Status         Latency (ms)     Speedup      abs_err
 ------------------------------------------------------------------------
-1a4c6ba1     PASSED         1.4013           16.789x      4.57e+05
-2e69caee     PASSED         0.6252           21.536x      4.10e+03
-4822167c     PASSED         0.9627           21.128x      4.10e+03
-58a34f27     PASSED         6.4640           5.970x       5.12e+05
-5e8dc11c     PASSED         8.3219           5.816x       6.31e+05
-5eadab1e     PASSED         0.8410           21.065x      4.10e+03
-6230e838     PASSED         0.9070           20.735x      4.10e+03
-74d7ff04     PASSED         0.9693           20.599x      4.10e+03
-76010cb4     PASSED         0.9182           20.961x      4.10e+03
-81955b1e     PASSED         0.9505           20.555x      4.10e+03
-8cba5890     PASSED         0.7239           21.683x      4.10e+03
-8f1ff9f1     PASSED         0.9838           21.420x      4.10e+03
-a7c2bcfd     PASSED         0.7289           21.997x      4.10e+03
-b8f4f012     PASSED         0.6490           21.767x      4.10e+03
-e05c6c03     PASSED         0.6193           20.561x      2.05e+03
-e626d3e6     PASSED         0.9598           21.244x      4.10e+03
-eedc63b2     PASSED         0.8707           20.697x      4.10e+03
-f7d6ac7c     PASSED         0.8361           20.624x      2.05e+03
-fc378037     PASSED         0.9517           20.636x      4.10e+03
+1a4c6ba1     PASSED         1.1105           17.696x      3.67e+05
+2e69caee     PASSED         0.3122           35.866x      4.10e+03
+4822167c     PASSED         0.7226           20.224x      4.10e+03
+58a34f27     PASSED         6.2345           5.625x       5.53e+05
+5e8dc11c     PASSED         8.1334           5.493x       5.20e+05
+5eadab1e     PASSED         0.5554           24.215x      4.10e+03
+6230e838     PASSED         0.6312           21.464x      4.10e+03
+74d7ff04     PASSED         0.6784           21.436x      4.10e+03
+76010cb4     PASSED         0.6301           22.121x      4.10e+03
+81955b1e     PASSED         0.6684           21.228x      4.10e+03
+8cba5890     PASSED         0.4362           27.557x      4.10e+03
+8f1ff9f1     PASSED         0.6952           22.505x      4.10e+03
+a7c2bcfd     PASSED         0.4421           27.797x      4.10e+03
+b8f4f012     PASSED         0.3440           33.007x      4.10e+03
+e05c6c03     PASSED         0.2943           36.636x      2.05e+03
+e626d3e6     PASSED         0.6794           22.102x      4.10e+03
+eedc63b2     PASSED         0.5900           22.606x      4.10e+03
+f7d6ac7c     PASSED         0.5501           23.397x      4.10e+03
+fc378037     PASSED         0.6688           21.290x      4.10e+03
 
 Summary (19 workloads):
-  Latency — min: 0.6193 ms  max: 8.3219 ms  median: 0.9182 ms
-  Speedup — min: 5.816x  max: 21.997x  mean: 19.252x
+  Latency — min: 0.2943 ms  max: 8.1334 ms  median: 0.6312 ms
+  Speedup — min: 5.493x  max: 36.636x  mean: 22.751x
