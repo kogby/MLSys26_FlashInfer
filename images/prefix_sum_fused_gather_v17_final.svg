@@ -1,0 +1,95 @@
+<svg viewBox="0 0 730 410" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif" style="">
+  <title style="fill:rgb(0, 0, 0);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto">GPU-Side Prefix Sum and Fused Gather v17</title>
+  <rect width="720" height="400" fill="var(--bg-1,#f8f9fa)" rx="12" style="fill:rgb(248, 249, 250);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- Title -->
+  <text x="360" y="34" text-anchor="middle" font-size="18" font-weight="700" fill="var(--text-1,#1a1a2e)" style="fill:rgb(26, 26, 46);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:18px;font-weight:700;text-anchor:middle;dominant-baseline:auto">GPU-Side Prefix Sum &amp; Fused Gather (v17)</text>
+
+  <!-- BEFORE -->
+  <text x="20" y="64" font-size="14" font-weight="700" fill="#c0392b" letter-spacing="1" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:14px;font-weight:700;text-anchor:start;dominant-baseline:auto">BEFORE</text>
+  <line x1="20" y1="70" x2="700" y2="70" stroke="#c0392b" stroke-width="1" stroke-dasharray="4,3" opacity="0.35" style="fill:rgb(0, 0, 0);stroke:rgb(192, 57, 43);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:4px, 3px;stroke-linecap:butt;stroke-linejoin:miter;opacity:0.35;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- Lane labels -->
+  <text x="20" y="96" font-size="13" font-weight="600" fill="#555" style="fill:rgb(85, 85, 85);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:start;dominant-baseline:auto">CPU</text>
+  <text x="20" y="137" font-size="13" font-weight="600" fill="#555" style="fill:rgb(85, 85, 85);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:start;dominant-baseline:auto">GPU</text>
+
+  <!-- Lane backgrounds -->
+  <rect x="58" y="78" width="642" height="32" rx="4" fill="var(--bg-2,#f0f0f0)" stroke="var(--border,#ced4da)" stroke-width="1" style="fill:rgb(240, 240, 240);stroke:rgb(206, 212, 218);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <rect x="58" y="118" width="642" height="32" rx="4" fill="var(--bg-2,#f0f0f0)" stroke="var(--border,#ced4da)" stroke-width="1" style="fill:rgb(240, 240, 240);stroke:rgb(206, 212, 218);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- GPU: _count_tokens -->
+  <rect x="60" y="120" width="118" height="28" rx="3" fill="#2980b9" style="fill:rgb(41, 128, 185);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="119" y="138" text-anchor="middle" font-size="12" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:12px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_count_tokens</text>
+
+  <!-- Sync bubble 1 (spans both lanes) -->
+  <rect x="181" y="76" width="56" height="76" rx="3" fill="#fdecea" stroke="#c0392b" stroke-width="1" stroke-dasharray="3,2" style="fill:rgb(253, 236, 234);stroke:rgb(192, 57, 43);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:3px, 2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="209" y="107" text-anchor="middle" font-size="11" font-weight="600" fill="#c0392b" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">CPU</text>
+  <text x="209" y="121" text-anchor="middle" font-size="11" font-weight="600" fill="#c0392b" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">sync ⚠</text>
+
+  <!-- CPU: cumsum dispatch — FIXED: wider block, 2-line text -->
+  <rect x="240" y="80" width="165" height="28" rx="3" fill="#e67e22" style="fill:rgb(230, 126, 34);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="322" y="91" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">cumsum → to → copy_</text>
+  <text x="322" y="104" text-anchor="middle" font-size="10" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:10px;font-weight:400;text-anchor:middle;dominant-baseline:auto">(3 CPU dispatches)</text>
+
+  <!-- GPU: idle -->
+  <rect x="240" y="120" width="165" height="28" rx="3" fill="#eeeeee" stroke="#ced4da" stroke-dasharray="3,2" style="fill:rgb(238, 238, 238);stroke:rgb(206, 212, 218);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:3px, 2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="322" y="138" text-anchor="middle" font-size="11" fill="#aaa" style="fill:rgb(170, 170, 170);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:400;text-anchor:middle;dominant-baseline:auto">GPU idle ⚠</text>
+
+  <!-- GPU: _scatter_tokens -->
+  <rect x="408" y="120" width="118" height="28" rx="3" fill="#2980b9" style="fill:rgb(41, 128, 185);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="467" y="138" text-anchor="middle" font-size="12" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:12px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_scatter_tokens</text>
+
+  <!-- Sync bubble 2 -->
+  <rect x="529" y="76" width="56" height="76" rx="3" fill="#fdecea" stroke="#c0392b" stroke-width="1" stroke-dasharray="3,2" style="fill:rgb(253, 236, 234);stroke:rgb(192, 57, 43);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:3px, 2px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="557" y="107" text-anchor="middle" font-size="11" font-weight="600" fill="#c0392b" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">CPU</text>
+  <text x="557" y="121" text-anchor="middle" font-size="11" font-weight="600" fill="#c0392b" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">sync ⚠</text>
+
+  <!-- GPU: aten::index × 2 -->
+  <rect x="588" y="120" width="110" height="28" rx="3" fill="#8e44ad" style="fill:rgb(142, 68, 173);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="643" y="133" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">aten::index × 2</text>
+  <text x="643" y="145" text-anchor="middle" font-size="10" fill="#ddd" style="fill:rgb(221, 221, 221);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:10px;font-weight:400;text-anchor:middle;dominant-baseline:auto">(~7.5 MB alloc)</text>
+
+  <!-- Warning note -->
+  <rect x="18" y="162" width="682" height="26" rx="4" fill="#fdecea" style="fill:rgb(253, 236, 234);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="360" y="179" text-anchor="middle" font-size="12" fill="#c0392b" style="fill:rgb(192, 57, 43);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">⚠  sorted_A [gcap, 7168] + sorted_A_scale allocated every call (~7.5 MB)  ·  2 CPU–GPU sync bubbles</text>
+
+  <!-- Divider -->
+  <line x1="20" y1="202" x2="700" y2="202" stroke="var(--border,#dee2e6)" stroke-width="1" style="fill:rgb(0, 0, 0);stroke:rgb(222, 226, 230);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- AFTER -->
+  <text x="20" y="224" font-size="14" font-weight="700" fill="#27ae60" letter-spacing="1" style="fill:rgb(39, 174, 96);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:14px;font-weight:700;text-anchor:start;dominant-baseline:auto">AFTER</text>
+  <line x1="20" y1="230" x2="700" y2="230" stroke="#27ae60" stroke-width="1" stroke-dasharray="4,3" opacity="0.35" style="fill:rgb(0, 0, 0);stroke:rgb(39, 174, 96);color:rgb(255, 255, 255);stroke-width:1px;stroke-dasharray:4px, 3px;stroke-linecap:butt;stroke-linejoin:miter;opacity:0.35;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- Lane labels -->
+  <text x="20" y="256" font-size="13" font-weight="600" fill="#555" style="fill:rgb(85, 85, 85);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:start;dominant-baseline:auto">CPU</text>
+  <text x="20" y="298" font-size="13" font-weight="600" fill="#555" style="fill:rgb(85, 85, 85);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:start;dominant-baseline:auto">GPU</text>
+
+  <!-- Lane backgrounds -->
+  <rect x="58" y="238" width="642" height="32" rx="4" fill="var(--bg-2,#f0f0f0)" stroke="var(--border,#ced4da)" stroke-width="1" style="fill:rgb(240, 240, 240);stroke:rgb(206, 212, 218);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <rect x="58" y="278" width="642" height="32" rx="4" fill="var(--bg-2,#f0f0f0)" stroke="var(--border,#ced4da)" stroke-width="1" style="fill:rgb(240, 240, 240);stroke:rgb(206, 212, 218);color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+
+  <!-- 4 continuous GPU kernels -->
+  <rect x="60" y="280" width="118" height="28" rx="3" fill="#27ae60" style="fill:rgb(39, 174, 96);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="119" y="298" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_count_tokens</text>
+
+  <rect x="180" y="280" width="138" height="28" rx="3" fill="#27ae60" style="fill:rgb(39, 174, 96);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="249" y="291" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_prefix_sum</text>
+  <text x="249" y="304" text-anchor="middle" font-size="10" fill="#d5f5e3" style="fill:rgb(213, 245, 227);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:10px;font-weight:400;text-anchor:middle;dominant-baseline:auto">(1 Triton kernel)</text>
+
+  <rect x="320" y="280" width="100" height="28" rx="3" fill="#27ae60" style="fill:rgb(39, 174, 96);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="370" y="298" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_scatter</text>
+
+  <rect x="422" y="280" width="276" height="28" rx="3" fill="#1e8449" style="fill:rgb(30, 132, 73);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="560" y="291" text-anchor="middle" font-size="11" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:11px;font-weight:600;text-anchor:middle;dominant-baseline:auto">_grouped_gemm1</text>
+  <text x="560" y="304" text-anchor="middle" font-size="10" fill="#a9dfbf" style="fill:rgb(169, 223, 191);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:10px;font-weight:400;text-anchor:middle;dominant-baseline:auto">(fused gather — no alloc)</text>
+
+  <!-- After note -->
+  <rect x="18" y="320" width="682" height="26" rx="4" fill="#eaf6ee" style="fill:rgb(234, 246, 238);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="360" y="337" text-anchor="middle" font-size="12" fill="#1e8449" style="fill:rgb(30, 132, 73);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:12px;font-weight:400;text-anchor:middle;dominant-baseline:auto">✓  No intermediate tensors  ·  2 sync bubbles eliminated  ·  GPU runs continuously</text>
+
+  <!-- Badges -->
+  <rect x="18" y="356" width="315" height="28" rx="6" fill="#1a3a5c" style="fill:rgb(26, 58, 92);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="176" y="374" text-anchor="middle" font-size="13" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:middle;dominant-baseline:auto">3 CPU dispatches → 1 Triton kernel</text>
+  <rect x="387" y="356" width="315" height="28" rx="6" fill="#1a3a5c" style="fill:rgb(26, 58, 92);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:16px;font-weight:400;text-anchor:start;dominant-baseline:auto"/>
+  <text x="545" y="374" text-anchor="middle" font-size="13" font-weight="600" fill="white" style="fill:rgb(255, 255, 255);stroke:none;color:rgb(255, 255, 255);stroke-width:1px;stroke-linecap:butt;stroke-linejoin:miter;opacity:1;font-family:system-ui, sans-serif;font-size:13px;font-weight:600;text-anchor:middle;dominant-baseline:auto">+33% mean speedup · ~7.5 MB saved</text>
+</svg>
